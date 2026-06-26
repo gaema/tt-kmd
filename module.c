@@ -61,6 +61,15 @@ MODULE_PARM_DESC(idle_power_down_grace_ms,
 		 "synchronously at close.  Only honored by device classes "
 		 "that opt in via defer_idle_powerdown.");
 
+bool reset_on_last_close = true;
+module_param(reset_on_last_close, bool, 0644);
+MODULE_PARM_DESC(reset_on_last_close,
+		 "On the last fd closing a device, re-initialize the Tensix "
+		 "grid + NoC so a process killed mid-init (SIGKILL/OOM) does "
+		 "not wedge the device for the next opener.  Only honored by "
+		 "device classes that opt in via last_release_cb (Blackhole). "
+		 "Default on.");
+
 const struct pci_device_id tenstorrent_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_TENSTORRENT, PCI_DEVICE_ID_GRAYSKULL),
 	  .driver_data=(kernel_ulong_t)NULL}, // Deprecated

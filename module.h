@@ -27,6 +27,7 @@ extern uint reset_limit;
 extern unsigned char auto_reset_timeout;
 extern bool power_policy;
 extern uint idle_power_down_grace_ms;
+extern bool reset_on_last_close;
 
 extern struct tenstorrent_device_class wormhole_class;
 extern struct tenstorrent_device_class blackhole_class;

@@ -70,6 +70,10 @@
 #define ARC_MSG_TYPE_TRIGGER_RESET 0x56
 #define ARC_MSG_TYPE_POWER_SETTING 0x21
 #define ARC_MSG_TYPE_TEST 0x90
+// Re-initialize the Tensix grid + NoC (ClearNocTranslation + NocInit +
+// TensixInit in CMFW).  Reachable over the ARC message queue only while the
+// ARC + NoC are alive.  See tt-zephyr-platforms reset.c:ReinitTensix.
+#define ARC_MSG_TYPE_REINIT_TENSIX 0x20
 #define ARC_BOOT_STATUS RESET_SCRATCH(2)
 #define ARC_BOOT_STATUS_READY_FOR_MSG 0x1
 
@@ -569,6 +573,38 @@ static bool blackhole_reset(struct tenstorrent_device *tt_dev, u32 reset_flag)
 	return false;
 }
 
+// Called from tt_cdev_release via dev_class->last_release_cb when the LAST fd
+// closes the device (chardev_open_count == 0).  A process killed mid-init
+// (SIGKILL / OOM) leaves the Tensix grid + NoC in a partially-programmed state
+// that wedges the next opener; re-initializing here makes the wedge
+// self-healing.  Because this only fires at count==0 there is no surviving
+// client to disturb.
+//
+// REINIT_TENSIX rides the ARC message queue, so it only works while the ARC +
+// NoC are still alive.  If the NoC is already hung send_arc_message fails
+// (boot_status reads 0xFFFFFFFF); we no-op gracefully in that case -- the
+// deeper recovery is the DMC-side auto-reset watchdog (sideband, not NoC),
+// which is out of scope for this last-close path.  Never crash the release
+// path: this runs under chardev_mutex with no fd to return an error to.
+static void blackhole_last_release(struct tenstorrent_device *tt_dev)
+{
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+	struct arc_msg msg = { 0 };
+
+	if (!reset_on_last_close)
+		return;
+
+	// Device is gone or mid-reset: nothing safe to talk to.
+	if (tt_dev->detached || tt_dev->needs_hw_init)
+		return;
+
+	msg.header = ARC_MSG_TYPE_REINIT_TENSIX;
+	if (!send_arc_message(bh, &msg))
+		dev_warn(&tt_dev->pdev->dev,
+			 "last-close grid re-init skipped; ARC/NoC unresponsive (likely hung). "
+			 "A DMC/cold reset may be required.\n");
+}
+
 static bool blackhole_init(struct tenstorrent_device *tt_dev)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
@@ -828,6 +864,7 @@ struct tenstorrent_device_class blackhole_class = {
 	.probe_telemetry = telemetry_probe,
 	.cleanup_hardware = blackhole_cleanup_hardware,
 	.cleanup_device = blackhole_cleanup,
+	.last_release_cb = blackhole_last_release,
 	.configure_tlb = blackhole_configure_tlb,
 	.describe_tlb = blackhole_describe_tlb,
 	.save_reset_state = blackhole_save_reset_state,
