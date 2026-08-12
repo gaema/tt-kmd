@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 
 #include "blackhole.h"
+#include "enumerate.h"	// PCI_VENDOR_ID_TENSTORRENT
 #include "pcie.h"
 #include "module.h"
 #include "msgqueue.h"
@@ -244,24 +245,117 @@ static u8 __iomem *bh_configure_kernel_tlb(struct blackhole_device *bh, u32 x, u
 	return bh->kernel_tlb + offset;
 }
 
-static u32 noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc)
+// Independent liveness probe.  Mirrors is_hardware_hung() (wormhole.c:129-138):
+// a PCI config read of the vendor ID does not use the NoC/TLB path that is
+// suspected dead, and it is the same probe tenstorrent_pci_remove() already
+// uses (enumerate.c:430-431) to decide whether the device is still there.
+//
+// Divergence from Wormhole, deliberate: WH's second half reads SCRATCH_REG(6)
+// through a directly-mapped BAR4 window (reset_unit_regs).  Blackhole has no
+// equivalent bare-BAR scratch register -- ARC scratch space is reachable only
+// through the kernel TLB, i.e. exactly the path being gated -- so the
+// substitute is NOC2AXI's NOC_ID, which blackhole_detect_pcie_noc_x() already
+// reads straight out of BAR0 with no TLB reprogram and no mutex.
+static bool bh_is_hardware_hung(struct blackhole_device *bh)
+{
+	struct pci_dev *pdev = bh->tt.pdev;
+	u16 vendor_id;
+
+	if (pdev != NULL && (pci_read_config_word(pdev, PCI_VENDOR_ID, &vendor_id) != PCIBIOS_SUCCESSFUL ||
+			     vendor_id != PCI_VENDOR_ID_TENSTORRENT))
+		return true;
+
+	return (ioread32(bh->noc2axi_cfg + NOC_ID_OFFSET) == 0xFFFFFFFFu);
+}
+
+static bool bh_hung(struct blackhole_device *bh)
+{
+	return atomic_read(&bh->hung) != 0;
+}
+
+// Clear the latch.  Called only from the paths that are *allowed* to talk to a
+// possibly-dead device -- reset and (re-)init -- because recovery has to be
+// able to issue MMIO or the latch would make the device unrecoverable without
+// a driver rebind.
+static void bh_clear_hung(struct blackhole_device *bh)
+{
+	mutex_lock(&bh->kernel_tlb_mutex);
+	bh->allones_streak = 0;
+	mutex_unlock(&bh->kernel_tlb_mutex);
+
+	atomic_set(&bh->hung, 0);
+}
+
+// Kernel-TLB read with an error channel.  Returns 0 and stores *value on
+// success; -EIO if the device is latched hung (in which case NO MMIO is
+// issued at all, and the kernel TLB mutex is not even taken); -EBUSY if
+// nowait was requested and another NoC user holds the mutex.
+//
+// bh_hung_threshold consecutive 0xFFFFFFFF results, confirmed by an
+// independent probe, latch the device.  Threshold 0 disables the latch.
+static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value, bool nowait)
 {
 	u32 val;
 	u8 __iomem *tlb_window;
+	unsigned int streak = 0;
+	bool latch = false;
 
-	mutex_lock(&bh->kernel_tlb_mutex);
+	if (bh_hung(bh))
+		return -EIO;
+
+	if (nowait) {
+		if (!mutex_trylock(&bh->kernel_tlb_mutex))
+			return -EBUSY;
+	} else {
+		mutex_lock(&bh->kernel_tlb_mutex);
+	}
 
 	tlb_window = bh_configure_kernel_tlb(bh, x, y, addr, noc);
 	val = ioread32(tlb_window);
 
+	if (val != 0xFFFFFFFFu) {
+		bh->allones_streak = 0;
+	} else if (bh_hung_threshold != 0) {
+		streak = ++bh->allones_streak;
+		if (streak >= bh_hung_threshold)
+			latch = bh_is_hardware_hung(bh);
+	}
+
 	mutex_unlock(&bh->kernel_tlb_mutex);
 
-	return val;
+	if (latch) {
+		atomic_set(&bh->hung, 1);
+		dev_err(&bh->tt.pdev->dev,
+			"device stopped answering (%u consecutive all-ones NoC reads, confirmed); "
+			"refusing further MMIO. Reset the device to clear.\n", streak);
+		return -EIO;
+	}
+
+	*value = val;
+	return 0;
+}
+
+static int noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value)
+{
+	return bh_noc_read32(bh, x, y, addr, noc, value, false);
+}
+
+// Telemetry-path variant: never queue behind another NoC user.  See the
+// comment on blackhole_read_telemetry_tag().
+static int noc_read32_nowait(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value)
+{
+	return bh_noc_read32(bh, x, y, addr, noc, value, true);
 }
 
 static void noc_write32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, u32 data, int noc)
 {
 	u8 __iomem *tlb_window;
+
+	// A latched device gets no writes either.  noc_write32() has no error
+	// channel and every caller ignores failure, so this is a silent drop --
+	// which is the correct behavior for a device that is not there.
+	if (bh_hung(bh))
+		return;
 
 	mutex_lock(&bh->kernel_tlb_mutex);
 
@@ -276,8 +370,15 @@ static int csm_read32(struct blackhole_device *bh, u64 addr, u32 *value)
 	if (!is_range_within_csm(addr, sizeof(u32)))
 		return -EINVAL;
 
-	*value = noc_read32(bh, ARC_X, ARC_Y, addr, 0);
-	return 0;
+	return noc_read32(bh, ARC_X, ARC_Y, addr, 0, value);
+}
+
+static int csm_read32_nowait(struct blackhole_device *bh, u64 addr, u32 *value)
+{
+	if (!is_range_within_csm(addr, sizeof(u32)))
+		return -EINVAL;
+
+	return noc_read32_nowait(bh, ARC_X, ARC_Y, addr, 0, value);
 }
 
 static int csm_write32(struct blackhole_device *bh, u64 addr, u32 value)
@@ -314,7 +415,9 @@ static void blackhole_save_reset_state(struct tenstorrent_device *tt_dev) {
 	if (!blackhole_detect_pcie_noc_x(bh, &x))
 		return;
 
-	device_control = noc_read32(bh, x, y, PCIE_DBI_ADDR + DBI_DEVICE_CONTROL_DEVICE_STATUS, 0);
+	if (noc_read32(bh, x, y, PCIE_DBI_ADDR + DBI_DEVICE_CONTROL_DEVICE_STATUS, 0, &device_control) != 0)
+		return;
+
 	bh->saved_mps = FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD, device_control);
 }
 
@@ -327,7 +430,9 @@ static void blackhole_restore_reset_state(struct tenstorrent_device *tt_dev) {
 	if (!blackhole_detect_pcie_noc_x(bh, &x))
 		return;
 
-	device_control = noc_read32(bh, x, y, PCIE_DBI_ADDR + DBI_DEVICE_CONTROL_DEVICE_STATUS, 0);
+	if (noc_read32(bh, x, y, PCIE_DBI_ADDR + DBI_DEVICE_CONTROL_DEVICE_STATUS, 0, &device_control) != 0)
+		return;
+
 	device_control &= ~PCI_EXP_DEVCTL_PAYLOAD;
 	device_control |= FIELD_PREP(PCI_EXP_DEVCTL_PAYLOAD, bh->saved_mps);
 	noc_write32(bh, x, y, PCIE_DBI_ADDR + DBI_DEVICE_CONTROL_DEVICE_STATUS, device_control, 0);
@@ -453,7 +558,15 @@ static int blackhole_read_telemetry_tag(struct tenstorrent_device *tt_dev, u16 t
 	if (addr == 0)
 		return -ENODATA;
 
-	return csm_read32(bh, addr, value);
+	// Telemetry is the lowest-value, highest-frequency NoC consumer in the
+	// driver (one hwmon/sysfs read per poll), and kernel_tlb_mutex is the
+	// device's ONLY kernel-side NoC serializer -- the ARC message queue,
+	// save/restore_reset_state and the last-close grid re-init all go
+	// through it.  A telemetry read that stalls on the wire while holding
+	// it convoys every one of those, including the recovery paths.  So
+	// telemetry never waits for the mutex: if someone else is on the NoC,
+	// the sample is dropped (-EBUSY) rather than queued.
+	return csm_read32_nowait(bh, addr, value);
 }
 
 static int telemetry_probe(struct tenstorrent_device *tt_dev)
@@ -467,8 +580,12 @@ static int telemetry_probe(struct tenstorrent_device *tt_dev)
 
 	memset(tt_dev->telemetry_tag_cache, 0, sizeof(tt_dev->telemetry_tag_cache));
 
-	base_addr = noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_PTR, 0);
-	data_addr = noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_DATA, 0);
+	if (noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_PTR, 0, &base_addr) != 0 ||
+	    noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_DATA, 0, &data_addr) != 0) {
+		dev_err(&tt_dev->pdev->dev, "Telemetry not available (device not responding)\n");
+		return -EIO;
+	}
+
 	tags_addr = base_addr + 8;
 
 	if (!is_range_within_csm(base_addr, 1) || !is_range_within_csm(data_addr, 1)) {
@@ -476,7 +593,9 @@ static int telemetry_probe(struct tenstorrent_device *tt_dev)
 		return -ENODEV;
 	}
 
-	version = noc_read32(bh, ARC_X, ARC_Y, base_addr, 0);
+	if (noc_read32(bh, ARC_X, ARC_Y, base_addr, 0, &version) != 0)
+		return -EIO;
+
 	major_ver = (version >> 16) & 0xFF;
 	minor_ver = (version >> 8) & 0xFF;
 	patch_ver = version & 0xFF;
@@ -486,13 +605,21 @@ static int telemetry_probe(struct tenstorrent_device *tt_dev)
 		return -ENOTSUPP;
 	}
 
-	num_entries = noc_read32(bh, ARC_X, ARC_Y, base_addr + 4, 0);
+	if (noc_read32(bh, ARC_X, ARC_Y, base_addr + 4, 0, &num_entries) != 0)
+		return -EIO;
 
 	for (i = 0; i < num_entries; ++i) {
-		u32 tag_entry = noc_read32(bh, ARC_X, ARC_Y, tags_addr + (i * 4), 0);
-		u16 tag_id = tag_entry & 0xFFFF;
-		u16 offset = (tag_entry >> 16) & 0xFFFF;
-		u32 addr = data_addr + (offset * 4);
+		u32 tag_entry;
+		u16 tag_id;
+		u16 offset;
+		u32 addr;
+
+		if (noc_read32(bh, ARC_X, ARC_Y, tags_addr + (i * 4), 0, &tag_entry) != 0)
+			return -EIO;
+
+		tag_id = tag_entry & 0xFFFF;
+		offset = (tag_entry >> 16) & 0xFFFF;
+		addr = data_addr + (offset * 4);
 
 		if (tag_id < TELEM_TAG_CACHE_SIZE)
 			tt_dev->telemetry_tag_cache[tag_id] = addr;
@@ -511,7 +638,8 @@ static bool send_arc_message(struct blackhole_device *bh, struct arc_msg *msg)
 	unsigned long timeout = jiffies + msecs_to_jiffies(ARC_MSG_READY_MS);
 
 	do {
-		boot_status = noc_read32(bh, ARC_X, ARC_Y, ARC_BOOT_STATUS, 0);
+		if (noc_read32(bh, ARC_X, ARC_Y, ARC_BOOT_STATUS, 0, &boot_status) != 0)
+			return false; // device latched hung, or MMIO refused
 		if (boot_status == 0xFFFFFFFFu)
 			return false; // NOC is hung
 		if (boot_status & ARC_BOOT_STATUS_READY_FOR_MSG)
@@ -521,7 +649,8 @@ static bool send_arc_message(struct blackhole_device *bh, struct arc_msg *msg)
 	if (!(boot_status & ARC_BOOT_STATUS_READY_FOR_MSG))
 		return false;
 
-	queue_ctrl_addr = noc_read32(bh, ARC_X, ARC_Y, ARC_MSG_QCB_PTR, 0);
+	if (noc_read32(bh, ARC_X, ARC_Y, ARC_MSG_QCB_PTR, 0, &queue_ctrl_addr) != 0)
+		return false;
 
 	if (csm_read32(bh, queue_ctrl_addr + 0, &queue_base) != 0)
 		return false;
@@ -547,6 +676,11 @@ static bool blackhole_reset(struct tenstorrent_device *tt_dev, u32 reset_flag)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	struct pci_dev *pdev = tt_dev->pdev;
+
+	// Reset is a recovery path: it is explicitly allowed to talk to a device
+	// we have given up on, so drop the latch before trying.  If the device is
+	// still dead the first read re-latches it.
+	bh_clear_hung(bh);
 
 	if (reset_flag == TENSTORRENT_RESET_DEVICE_ASIC_DMC_RESET) {
 		struct arc_msg msg = { 0 };
@@ -645,6 +779,9 @@ static bool blackhole_init(struct tenstorrent_device *tt_dev)
 	set_bit(KERNEL_TLB_INDEX, tt_dev->tlbs);
 	mutex_init(&bh->kernel_tlb_mutex);
 
+	bh->allones_streak = 0;
+	atomic_set(&bh->hung, 0);
+
 	for (i = 0; i < ARRAY_SIZE(bh_sysfs_attributes); ++i)
 		tt_dev->telemetry_attrs[i] = &bh_sysfs_attributes[i].attr.attr;
 	tt_dev->telemetry_group.attrs = tt_dev->telemetry_attrs;
@@ -658,6 +795,10 @@ static bool blackhole_init_hardware(struct tenstorrent_device *tt_dev)
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	struct pci_dev *pdev = tt_dev->pdev;
 	struct arc_msg msg = { 0 };
+
+	// (Re-)init is the other recovery path -- probe, resume, and the PCIe
+	// error handler's .resume all land here.  Same reasoning as reset.
+	bh_clear_hung(bh);
 
 	pcie_set_readrq(pdev, MAX_MRRS);
 

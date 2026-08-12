@@ -507,6 +507,93 @@ static int tenstorrent_resume(struct device *dev) {
 
 static SIMPLE_DEV_PM_OPS(tenstorrent_pm_ops, tenstorrent_suspend, tenstorrent_resume);
 
+// PCIe error recovery.  Without an .err_handler the PCI core reports
+// NO_AER_DRIVER and an AER/DPC recovery ends by removing and re-enumerating
+// the device with the driver still poking at it; with one, the driver is told
+// to stop touching the hardware before the link is reset, and gets a chance to
+// come back afterwards.
+//
+// This is deliberately the minimal set: .error_detected quiesces,
+// .slot_reset re-enables the function, .resume re-inits.  There is no
+// .mmio_enabled because we never return PCI_ERS_RESULT_CAN_RECOVER -- an
+// endpoint that raised an uncorrectable error is not one we want to keep
+// reading through.
+static pci_ers_result_t tenstorrent_error_detected(struct pci_dev *dev, pci_channel_state_t state)
+{
+	struct tenstorrent_device *tt_dev = pci_get_drvdata(dev);
+
+	dev_err(&dev->dev, "PCIe error detected (channel state %u); quiescing device\n", (unsigned int)state);
+
+	if (tt_dev == NULL)
+		return PCI_ERS_RESULT_NONE;
+
+	// detached is the driver's existing "no longer valid for hardware
+	// access" flag (device.h:32); every ioctl, sysfs and hwmon path already
+	// honors it, so setting it here is all that is needed to stop the
+	// driver generating MMIO.  Taken under chardev_mutex for the same
+	// reason tenstorrent_pci_remove() does (enumerate.c:421-423): it fences
+	// deferred-powerdown arming in tt_cdev_release.
+	mutex_lock(&tt_dev->chardev_mutex);
+	tt_dev->detached = true;
+	mutex_unlock(&tt_dev->chardev_mutex);
+
+	// Not the _sync variant: the work item itself talks to the device, and
+	// an error callback must not block waiting for MMIO to a dead link.
+	cancel_delayed_work(&tt_dev->power_down_work);
+
+	if (state == pci_channel_io_perm_failure)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	return PCI_ERS_RESULT_NEED_RESET;
+}
+
+static pci_ers_result_t tenstorrent_slot_reset(struct pci_dev *dev)
+{
+	if (pci_enable_device(dev) != 0) {
+		dev_err(&dev->dev, "Failed to re-enable device after slot reset\n");
+		return PCI_ERS_RESULT_DISCONNECT;
+	}
+
+	pci_set_master(dev);
+	pci_restore_state(dev);
+	pci_save_state(dev);
+
+	return PCI_ERS_RESULT_RECOVERED;
+}
+
+static void tenstorrent_error_resume(struct pci_dev *dev)
+{
+	struct tenstorrent_device *tt_dev = pci_get_drvdata(dev);
+
+	if (tt_dev == NULL)
+		return;
+
+	// Exclusive: nothing may be touching the hardware while it re-inits.
+	// This also serializes against RESET_DEVICE and remove.  detached is
+	// written here rather than under chardev_mutex to avoid nesting that
+	// lock inside reset_rwsem; the exclusive rwsem already excludes every
+	// hardware path, and a release that races the clear simply observes a
+	// device that is once again alive.
+	down_write(&tt_dev->reset_rwsem);
+
+	tt_dev->needs_hw_init = !tt_dev->dev_class->init_hardware(tt_dev);
+	if (!tt_dev->needs_hw_init) {
+		tt_dev->detached = false;
+		dev_info(&dev->dev, "Device recovered after PCIe error\n");
+	} else {
+		dev_err(&dev->dev,
+			"Device did not come back after PCIe error; it stays detached until it is unbound and rebound\n");
+	}
+
+	up_write(&tt_dev->reset_rwsem);
+}
+
+static const struct pci_error_handlers tenstorrent_err_handler = {
+	.error_detected = tenstorrent_error_detected,
+	.slot_reset = tenstorrent_slot_reset,
+	.resume = tenstorrent_error_resume,
+};
+
 extern const struct pci_device_id tenstorrent_ids[];
 static struct pci_driver tenstorrent_pci_driver = {
 	.name = TENSTORRENT,
@@ -514,6 +601,7 @@ static struct pci_driver tenstorrent_pci_driver = {
 	.probe = tenstorrent_pci_probe,
 	.remove = tenstorrent_pci_remove,
 	.shutdown = tenstorrent_pci_remove,
+	.err_handler = &tenstorrent_err_handler,
 
 	.driver.pm = &tenstorrent_pm_ops,
 };

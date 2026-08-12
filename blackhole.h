@@ -4,6 +4,7 @@
 #ifndef TTDRIVER_BLACKHOLE_H_INCLUDED
 #define TTDRIVER_BLACKHOLE_H_INCLUDED
 
+#include <linux/atomic.h>
 #include <linux/types.h>
 #include "device.h"
 
@@ -17,6 +18,18 @@ struct blackhole_device {
 	u8 __iomem *bar2_mapping;
 
 	u8 saved_mps;
+
+	// Device-liveness latch.  Wormhole has had one of these since forever
+	// (is_hardware_hung(), wormhole.c:129-138, consumed at wormhole.c:180-185
+	// and :295); Blackhole did not, so a card that stopped answering was read
+	// again on every hwmon/sysfs poll, forever.
+	//
+	// allones_streak counts consecutive 0xFFFFFFFF results from the kernel
+	// TLB read path and is only touched with kernel_tlb_mutex held.  hung is
+	// tested on every MMIO entry without that mutex (that is the point: a
+	// latched device must not even reach the lock), so it is atomic.
+	unsigned int allones_streak;
+	atomic_t hung;
 
 	bool pcie_perf_group_registered;
 	bool telemetry_group_registered;

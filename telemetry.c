@@ -13,7 +13,14 @@ int tt_telemetry_read32(struct tenstorrent_device *tt_dev, u16 tag_id, u32 *valu
 	if (tag_id >= TELEM_TAG_CACHE_SIZE)
 		return -EINVAL;
 
-	down_read(&tt_dev->reset_rwsem);
+	// Do not queue behind a writer.  reset_rwsem's writers are RESET_DEVICE
+	// (chardev.c:571) and tenstorrent_pci_remove() (enumerate.c:442) -- the
+	// recovery and teardown paths.  A periodic hwmon/sysfs poller that takes
+	// the read side and then stalls on MMIO holds both of them off; refusing
+	// the sample instead keeps them free.  Costs a dropped reading (-EBUSY)
+	// whenever a telemetry read races a reset or an unload.
+	if (!down_read_trylock(&tt_dev->reset_rwsem))
+		return -EBUSY;
 
 	if (tt_dev->detached) {
 		r = -ENODEV;
