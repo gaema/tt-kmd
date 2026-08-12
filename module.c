@@ -74,12 +74,11 @@ uint bh_hung_threshold = 3;
 module_param(bh_hung_threshold, uint, 0644);
 MODULE_PARM_DESC(bh_hung_threshold,
 		 "Blackhole: number of consecutive all-ones (0xFFFFFFFF) kernel "
-		 "NoC reads after which the device is latched as not responding "
-		 "and further MMIO is refused with -EIO instead of being issued "
-		 "to a card that has stopped answering.  The latch only arms "
-		 "when an independent probe (PCI config vendor ID, NOC_ID) "
-		 "agrees, and is cleared by device reset or re-init.  0 disables "
-		 "the latch (pre-patch behavior).  Default 3.");
+		 "TLB/NoC reads after which the device is latched as not "
+		 "responding and further MMIO is refused with -EIO.  Arms on the "
+		 "TLB path alone (ARC/NoC hang with a live endpoint is enough); "
+		 "BAR0/config probe is log classification only.  Cleared by "
+		 "device reset or re-init.  0 disables the latch.  Default 3.");
 
 const struct pci_device_id tenstorrent_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_TENSTORRENT, PCI_DEVICE_ID_GRAYSKULL),

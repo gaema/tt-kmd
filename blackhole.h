@@ -19,15 +19,10 @@ struct blackhole_device {
 
 	u8 saved_mps;
 
-	// Device-liveness latch.  Wormhole has had one of these since forever
-	// (is_hardware_hung(), wormhole.c:129-138, consumed at wormhole.c:180-185
-	// and :295); Blackhole did not, so a card that stopped answering was read
-	// again on every hwmon/sysfs poll, forever.
-	//
-	// allones_streak counts consecutive 0xFFFFFFFF results from the kernel
-	// TLB read path and is only touched with kernel_tlb_mutex held.  hung is
-	// tested on every MMIO entry without that mutex (that is the point: a
-	// latched device must not even reach the lock), so it is atomic.
+	// Device-liveness latch (Wormhole parity).  Arms after N consecutive
+	// kernel-TLB all-ones reads — including ARC/NoC hang while BAR0 still
+	// answers.  allones_streak is only touched under kernel_tlb_mutex;
+	// hung is atomic and tested before taking that mutex.
 	unsigned int allones_streak;
 	atomic_t hung;
 

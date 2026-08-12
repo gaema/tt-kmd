@@ -256,7 +256,16 @@ static u8 __iomem *bh_configure_kernel_tlb(struct blackhole_device *bh, u32 x, u
 // through the kernel TLB, i.e. exactly the path being gated -- so the
 // substitute is NOC2AXI's NOC_ID, which blackhole_detect_pcie_noc_x() already
 // reads straight out of BAR0 with no TLB reprogram and no mutex.
-static bool bh_is_hardware_hung(struct blackhole_device *bh)
+// Classify *why* the card looks dead.  Used only for logging after the latch
+// has already decided to arm — never as a veto (see bh_noc_read32).
+//
+// - Endpoint gone: PCI config vendor-ID fails / not Tenstorrent, or BAR0
+//   NOC_ID is all-ones (link/BAR dead).  Wormhole-shaped probe.
+// - Path dead, endpoint alive: TLB/NoC returns all-ones while BAR0 still
+//   answers.  That is the aipro ARC/NoC hang class; the first land of this
+//   latch incorrectly required the endpoint probe to agree, so it never
+//   armed and hwmon kept issuing TLB MMIO forever.
+static bool bh_endpoint_gone(struct blackhole_device *bh)
 {
 	struct pci_dev *pdev = bh->tt.pdev;
 	u16 vendor_id;
@@ -271,6 +280,24 @@ static bool bh_is_hardware_hung(struct blackhole_device *bh)
 static bool bh_hung(struct blackhole_device *bh)
 {
 	return atomic_read(&bh->hung) != 0;
+}
+
+// Arm the latch.  Safe to call from any context that has already decided the
+// device is not answering; idempotent.  Logs once per transition to hung.
+static void bh_set_hung(struct blackhole_device *bh, const char *why, unsigned int streak)
+{
+	if (atomic_xchg(&bh->hung, 1) != 0)
+		return;
+
+	if (streak)
+		dev_err(&bh->tt.pdev->dev,
+			"device stopped answering (%u consecutive all-ones kernel-TLB reads, %s); "
+			"refusing further MMIO. Reset the device to clear.\n",
+			streak, why);
+	else
+		dev_err(&bh->tt.pdev->dev,
+			"device stopped answering (%s); refusing further MMIO. "
+			"Reset the device to clear.\n", why);
 }
 
 // Clear the latch.  Called only from the paths that are *allowed* to talk to a
@@ -291,8 +318,10 @@ static void bh_clear_hung(struct blackhole_device *bh)
 // issued at all, and the kernel TLB mutex is not even taken); -EBUSY if
 // nowait was requested and another NoC user holds the mutex.
 //
-// bh_hung_threshold consecutive 0xFFFFFFFF results, confirmed by an
-// independent probe, latch the device.  Threshold 0 disables the latch.
+// bh_hung_threshold consecutive 0xFFFFFFFF results on the kernel-TLB path
+// latch the device.  Threshold 0 disables the latch.  Confirmation against
+// BAR0/config is classification-only (log string), never a veto: an ARC/NoC
+// hang with a live endpoint still produces TLB all-ones and must arm.
 static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value, bool nowait)
 {
 	u32 val;
@@ -318,16 +347,18 @@ static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, in
 	} else if (bh_hung_threshold != 0) {
 		streak = ++bh->allones_streak;
 		if (streak >= bh_hung_threshold)
-			latch = bh_is_hardware_hung(bh);
+			latch = true;
 	}
 
 	mutex_unlock(&bh->kernel_tlb_mutex);
 
 	if (latch) {
-		atomic_set(&bh->hung, 1);
-		dev_err(&bh->tt.pdev->dev,
-			"device stopped answering (%u consecutive all-ones NoC reads, confirmed); "
-			"refusing further MMIO. Reset the device to clear.\n", streak);
+		// Probe OUTSIDE the TLB mutex (must not convoy other NoC users
+		// behind a possibly-stalling BAR0 read).
+		const char *why = bh_endpoint_gone(bh) ?
+			"endpoint/BAR dead" :
+			"TLB/NoC path dead (endpoint still answers BAR0)";
+		bh_set_hung(bh, why, streak);
 		return -EIO;
 	}
 
@@ -347,15 +378,13 @@ static int noc_read32_nowait(struct blackhole_device *bh, u32 x, u32 y, u64 addr
 	return bh_noc_read32(bh, x, y, addr, noc, value, true);
 }
 
-static void noc_write32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, u32 data, int noc)
+// Returns 0 on success, -EIO if the device is latched hung (no MMIO issued).
+static int noc_write32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, u32 data, int noc)
 {
 	u8 __iomem *tlb_window;
 
-	// A latched device gets no writes either.  noc_write32() has no error
-	// channel and every caller ignores failure, so this is a silent drop --
-	// which is the correct behavior for a device that is not there.
 	if (bh_hung(bh))
-		return;
+		return -EIO;
 
 	mutex_lock(&bh->kernel_tlb_mutex);
 
@@ -363,6 +392,7 @@ static void noc_write32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, u32
 	iowrite32(data, tlb_window);
 
 	mutex_unlock(&bh->kernel_tlb_mutex);
+	return 0;
 }
 
 static int csm_read32(struct blackhole_device *bh, u64 addr, u32 *value)
@@ -386,8 +416,10 @@ static int csm_write32(struct blackhole_device *bh, u64 addr, u32 value)
 	if (!is_range_within_csm(addr, sizeof(u32)))
 		return -EINVAL;
 
-	noc_write32(bh, ARC_X, ARC_Y, addr, value, 0);
-	return 0;
+	// Propagate hung as -EIO so arc_msg_push/pop (which already check
+	// csm_write32 != 0) do not believe a queue pointer advanced on a
+	// dead card.
+	return noc_write32(bh, ARC_X, ARC_Y, addr, value, 0);
 }
 
 static int blackhole_csm_read32(struct tenstorrent_device *tt_dev, u64 addr, u32 *value)
@@ -402,6 +434,9 @@ static int blackhole_csm_write32(struct tenstorrent_device *tt_dev, u64 addr, u3
 
 // BH has two PCIE instances, the function reads NOC ID to find out which one is active
 static bool blackhole_detect_pcie_noc_x(struct blackhole_device *bh, u32 *noc_x) {
+	if (bh_hung(bh))
+		return false;
+
 	*noc_x = ioread32(bh->noc2axi_cfg + NOC_ID_OFFSET) & 0x3F;
 	return (*noc_x == 2 || *noc_x == 11);
 }
@@ -435,7 +470,7 @@ static void blackhole_restore_reset_state(struct tenstorrent_device *tt_dev) {
 
 	device_control &= ~PCI_EXP_DEVCTL_PAYLOAD;
 	device_control |= FIELD_PREP(PCI_EXP_DEVCTL_PAYLOAD, bh->saved_mps);
-	noc_write32(bh, x, y, PCIE_DBI_ADDR + DBI_DEVICE_CONTROL_DEVICE_STATUS, device_control, 0);
+	(void)noc_write32(bh, x, y, PCIE_DBI_ADDR + DBI_DEVICE_CONTROL_DEVICE_STATUS, device_control, 0);
 }
 
 static ssize_t bh_show_pcie_single_counter(struct device *dev, char *buf, u32 counter_offset, int noc)
@@ -443,7 +478,14 @@ static ssize_t bh_show_pcie_single_counter(struct device *dev, char *buf, u32 co
 	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	u64 offset = NOC_STATUS_OFFSET + (4 * counter_offset) + (noc * NOC1_NOC2AXI_OFFSET);
-	u32 value = ioread32(bh->noc2axi_cfg + offset);
+	u32 value;
+
+	// Bare BAR0 path — was not covered by the TLB latch.  Do not poke a
+	// card we have already given up on (or that PCI recovery detached).
+	if (tt_dev->detached || bh_hung(bh))
+		return -EIO;
+
+	value = ioread32(bh->noc2axi_cfg + offset);
 	return scnprintf(buf, PAGE_SIZE, "%u\n", value);
 }
 
@@ -640,8 +682,13 @@ static bool send_arc_message(struct blackhole_device *bh, struct arc_msg *msg)
 	do {
 		if (noc_read32(bh, ARC_X, ARC_Y, ARC_BOOT_STATUS, 0, &boot_status) != 0)
 			return false; // device latched hung, or MMIO refused
-		if (boot_status == 0xFFFFFFFFu)
-			return false; // NOC is hung
+		if (boot_status == 0xFFFFFFFFu) {
+			// Single all-ones on the ARC boot status is already the
+			// driver's historical "NOC is hung" signal; arm the latch
+			// so subsequent hwmon/ioctl paths stop issuing MMIO.
+			bh_set_hung(bh, "ARC_BOOT_STATUS all-ones", 0);
+			return false;
+		}
 		if (boot_status & ARC_BOOT_STATUS_READY_FOR_MSG)
 			break;
 	} while (time_before(jiffies, timeout));
@@ -664,7 +711,8 @@ static bool send_arc_message(struct blackhole_device *bh, struct arc_msg *msg)
 		return false;
 
 	// Trigger ARC interrupt
-	noc_write32(bh, ARC_X, ARC_Y, ARC_MSI_FIFO, 0, 0);
+	if (noc_write32(bh, ARC_X, ARC_Y, ARC_MSI_FIFO, 0, 0) != 0)
+		return false;
 
 	if (!arc_msg_pop(&bh->tt, msg, queue_base, num_entries))
 		return false;
@@ -799,6 +847,11 @@ static bool blackhole_init_hardware(struct tenstorrent_device *tt_dev)
 	// (Re-)init is the other recovery path -- probe, resume, and the PCIe
 	// error handler's .resume all land here.  Same reasoning as reset.
 	bh_clear_hung(bh);
+
+	if (bh_hung_threshold != 0)
+		dev_info(&pdev->dev,
+			 "host-hang MMIO latch enabled (bh_hung_threshold=%u)\n",
+			 bh_hung_threshold);
 
 	pcie_set_readrq(pdev, MAX_MRRS);
 
@@ -967,7 +1020,8 @@ static int blackhole_configure_outbound_atu(struct tenstorrent_device *tt_dev, u
 static void blackhole_noc_write32(struct tenstorrent_device *tt_dev, u32 x, u32 y, u64 addr, u32 data, int noc)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
-	noc_write32(bh, x, y, addr, data, noc);
+
+	(void)noc_write32(bh, x, y, addr, data, noc);
 }
 
 static int blackhole_set_power_state(struct tenstorrent_device *tt_dev, struct tenstorrent_power_state *power_state)
