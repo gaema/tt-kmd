@@ -52,7 +52,7 @@ show-version:
 	@echo "Current version: $(VERSION)"
 
 dkms:
-	@$(MODULE_DIR)/tools/gen-build-id >/dev/null	# refresh .gaema-build-id; dkms add drops .git
+	@$(MODULE_DIR)/tools/gen-build-id >/dev/null	# refresh gaema-build-id; dkms add drops .git AND dotfiles
 	sudo dkms add .
 	sudo dkms install --force tenstorrent/$(VERSION)
 	sudo modprobe tenstorrent
