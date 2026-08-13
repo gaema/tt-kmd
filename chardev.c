@@ -841,7 +841,19 @@ static void tt_cdev_release_power(struct chardev_private *priv)
 	if (!power_policy)
 		return;
 
-	if (no_power_contrib)
+	// A client that contributed no power normally needs no re-aggregation on
+	// close: the aggregate cannot change.  That shortcut is wrong on the LAST
+	// close, because last_release_cb has just re-programmed the device behind
+	// our back -- blackhole_last_release() sends REINIT_TENSIX, whose CMFW
+	// handler runs NocInit + TensixInit and leaves the grid fully powered.
+	// Skipping the re-assertion there strands the device ungated forever
+	// (~20 W/die on p300c) with no fd open and nothing left to gate it.
+	//
+	// On last close, aggregation over an empty open_fds_list yields
+	// power_flags = 0, so falling through re-asserts the gate.  Any
+	// power-aware opener hits this, including one that crashes or is
+	// SIGKILLed, so it cannot be fixed in userspace.
+	if (no_power_contrib && !last_close)
 		return;
 
 	if (can_defer && last_close)
