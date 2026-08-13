@@ -15,6 +15,7 @@
 #include "enumerate.h"
 
 #include "module.h"
+#include "gaema-build.h"
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 #error "tt-kmd requires Linux 5.4 or later"
@@ -29,6 +30,11 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Tenstorrent AI kernel driver");
 MODULE_VERSION(TENSTORRENT_DRIVER_VERSION_STRING);
+
+// Which commit of our fork this .ko was built from.  MODULE_VERSION alone says
+// "some gaema build"; this says which one, readable on a host with no source
+// tree via `modinfo tenstorrent | grep gaema_build`.
+MODULE_INFO(gaema_build, GAEMA_BUILD_ID);
 
 struct dentry *tt_debugfs_root;
 struct proc_dir_entry *tt_procfs_root;
@@ -96,7 +102,8 @@ static int __init ttdriver_init(void)
 {
 	int err = 0;
 
-	pr_info("Loading Tenstorrent AI driver module v%s\n", TENSTORRENT_DRIVER_VERSION_STRING);
+	pr_info("Loading Tenstorrent AI driver module v%s (build %s)\n",
+		TENSTORRENT_DRIVER_VERSION_STRING, GAEMA_BUILD_ID);
 
 	tt_debugfs_root = debugfs_create_dir("tenstorrent", NULL);
 

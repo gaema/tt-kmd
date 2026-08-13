@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: GPL-2.0-only
+
+# Print a build identity for this source tree, for embedding in the module as
+# MODULE_INFO(gaema_build, ...).
+#
+# The point is that `modinfo tenstorrent` on a host with no source tree must be
+# able to answer "which commit is this .ko?".  MODULE_VERSION only carries
+# 2.9.0-gaema, which distinguishes our fork from upstream but not one of our
+# builds from another.
+#
+# Order of resolution:
+#   1. `git describe` in this tree, when a .git exists.  The result is also
+#      cached to .gaema-build-id, so it survives being copied out of git.
+#   2. The cached .gaema-build-id, for DKMS/AKMS builds -- `dkms add` copies
+#      the source into /usr/src/tenstorrent-<version>/ WITHOUT .git, so without
+#      this cache every DKMS-built module would report "unknown".
+#   3. "unknown".
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+STAMP="${PROJECT_ROOT}/.gaema-build-id"
+
+id=""
+
+if git -C "${PROJECT_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+    id="$(git -C "${PROJECT_ROOT}" describe --always --dirty --abbrev=12 2>/dev/null || true)"
+    if [[ -n "${id}" ]]; then
+        # Cache for the no-.git consumers.  A read-only tree is not an error.
+        printf '%s\n' "${id}" > "${STAMP}" 2>/dev/null || true
+    fi
+fi
+
+if [[ -z "${id}" && -r "${STAMP}" ]]; then
+    read -r id < "${STAMP}" || id=""
+fi
+
+printf '%s\n' "${id:-unknown}"

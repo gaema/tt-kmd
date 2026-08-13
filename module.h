@@ -19,7 +19,12 @@
 #define TENSTORRENT_DRIVER_VERSION_MAJOR 2
 #define TENSTORRENT_DRIVER_VERSION_MINOR 9
 #define TENSTORRENT_DRIVER_VERSION_PATCH 0
-#define TENSTORRENT_DRIVER_VERSION_SUFFIX ""
+// Our fork is not upstream TTKMD.  The suffix makes that visible in
+// `modinfo tenstorrent | grep version`, in the DKMS tree name, and in the
+// dmesg load banner, so a host can never again report a bare upstream version
+// string for a module built from local patches.  Keep it in sync with
+// PACKAGE_VERSION in dkms.conf and modver in AKMBUILD (see VERSION_UPDATE.md).
+#define TENSTORRENT_DRIVER_VERSION_SUFFIX "-gaema"
 
 // Module options that need to be passed to other files
 extern uint dma_address_bits;
