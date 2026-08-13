@@ -289,21 +289,27 @@ static void bh_set_hung(struct blackhole_device *bh, const char *why, unsigned i
 	if (atomic_xchg(&bh->hung, 1) != 0)
 		return;
 
+	// Name the cheap recovery first.  The old text said only "Reset the
+	// device to clear", which sent every operator to tt-smi -r (a real ASIC
+	// reset that drops all device state) even when the latch was the only
+	// thing left refusing MMIO.
 	if (streak)
 		dev_err(&bh->tt.pdev->dev,
 			"device stopped answering (%u consecutive all-ones kernel-TLB reads, %s); "
-			"refusing further MMIO. Reset the device to clear.\n",
-			streak, why);
+			"refusing further MMIO. Clear with "
+			"'echo 0 > /sys/class/" TENSTORRENT "/%s/tt_hung', or reset the device.\n",
+			streak, why, dev_name(&bh->tt.dev));
 	else
 		dev_err(&bh->tt.pdev->dev,
-			"device stopped answering (%s); refusing further MMIO. "
-			"Reset the device to clear.\n", why);
+			"device stopped answering (%s); refusing further MMIO. Clear with "
+			"'echo 0 > /sys/class/" TENSTORRENT "/%s/tt_hung', or reset the device.\n",
+			why, dev_name(&bh->tt.dev));
 }
 
-// Clear the latch.  Called only from the paths that are *allowed* to talk to a
-// possibly-dead device -- reset and (re-)init -- because recovery has to be
-// able to issue MMIO or the latch would make the device unrecoverable without
-// a driver rebind.
+// Clear the latch.  Called from the paths that are *allowed* to talk to a
+// possibly-dead device -- reset, (re-)init, and the tt_hung sysfs control --
+// because recovery has to be able to issue MMIO or the latch would make the
+// device unrecoverable without a driver rebind.
 static void bh_clear_hung(struct blackhole_device *bh)
 {
 	mutex_lock(&bh->kernel_tlb_mutex);
@@ -537,6 +543,77 @@ static struct attribute *bh_pcie_perf_counters_attrs[] = {
 static const struct attribute_group bh_pcie_perf_counters_group = {
 	.name = "pcie_perf_counters",
 	.attrs = bh_pcie_perf_counters_attrs,
+};
+
+// Liveness-latch control + observability.
+//
+// Before this existed the latch was write-only from the kernel's side: nothing
+// but a dmesg grep could answer "is this die fenced?", and nothing but an ASIC
+// reset (tt-smi -r) or a module reload could un-fence it.  Both drop all device
+// state on the die, and the module reload drops it on every die in the box, so
+// a probe that read one unmapped NoC coordinate cost a human intervention.
+//
+// The latch is a HOST-SIDE SOFTWARE FLAG.  Arming it only stops the driver
+// issuing MMIO; clearing it writes nothing whatsoever to the device.  So the
+// clear is not a "force" and cannot corrupt hardware state -- it only restores
+// the driver's willingness to look.
+//
+// Clearing is bounded, not a bypass.  bh_clear_hung() resets allones_streak to
+// 0, so a device that really is dead re-arms after at most bh_hung_threshold
+// further kernel-TLB reads -- or immediately, on the ARC_BOOT_STATUS path,
+// which arms on a single all-ones read.  The unbounded hwmon/telemetry MMIO
+// storm the latch exists to stop therefore stays stopped: the cost of a
+// mistaken clear is a few reads, not a regression to the pre-latch behaviour.
+//
+// Writing 1 arms the latch.  That is deliberately supported: it lets a probe
+// harness fence a die it is about to poke at, and it makes the guard testable
+// without having to wedge real silicon.
+static ssize_t tt_hung_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", bh_hung(bh) ? 1 : 0);
+}
+
+static ssize_t tt_hung_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+	unsigned int arm;
+	int r;
+
+	r = kstrtouint(buf, 0, &arm);
+	if (r)
+		return r;
+
+	if (arm) {
+		bh_set_hung(bh, "armed via tt_hung sysfs", 0);
+	} else {
+		if (bh_hung(bh))
+			dev_info(&tt_dev->pdev->dev,
+				 "host-hang latch cleared via tt_hung sysfs; resuming MMIO. "
+				 "It re-arms on the next all-ones read if the device really is gone.\n");
+		bh_clear_hung(bh);
+	}
+
+	return count;
+}
+static DEVICE_ATTR_RW(tt_hung);
+
+static struct attribute *bh_hang_attrs[] = {
+	ATTR_LIST(tt_hung),
+	NULL,
+};
+
+// Unnamed group: tt_hung lands directly in the device directory next to the
+// tt_* telemetry attributes.  Registered unconditionally and separately from
+// the telemetry group, because the case that most needs it -- a die fenced
+// early enough that telemetry_probe() failed -- is exactly the case where the
+// telemetry group is absent.
+static const struct attribute_group bh_hang_group = {
+	.attrs = bh_hang_attrs,
 };
 
 static const struct tt_hwmon_label bh_hwmon_labels[] = {
@@ -873,6 +950,17 @@ static bool blackhole_init_telemetry(struct tenstorrent_device *tt_dev)
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	int r;
 
+	// Register the latch control first and unconditionally: it is the
+	// recovery handle, so it must exist even when everything after this
+	// point fails on a die that is already fenced.
+	if (!bh->hang_group_registered) {
+		r = device_add_group(&tt_dev->dev, &bh_hang_group);
+		if (r)
+			dev_err(&tt_dev->pdev->dev, "host-hang latch control unavailable: %d\n", r);
+		else
+			bh->hang_group_registered = true;
+	}
+
 	r = device_add_group(&tt_dev->dev, &bh_pcie_perf_counters_group);
 	if (r)
 		dev_err(&tt_dev->pdev->dev, "PCIe perf counters unavailable: %d\n", r);
@@ -921,6 +1009,11 @@ static void blackhole_cleanup_telemetry(struct tenstorrent_device *tt_dev)
 	if (bh->pcie_perf_group_registered) {
 		device_remove_group(&tt_dev->dev, &bh_pcie_perf_counters_group);
 		bh->pcie_perf_group_registered = false;
+	}
+
+	if (bh->hang_group_registered) {
+		device_remove_group(&tt_dev->dev, &bh_hang_group);
+		bh->hang_group_registered = false;
 	}
 }
 

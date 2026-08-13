@@ -28,6 +28,10 @@ struct blackhole_device {
 
 	bool pcie_perf_group_registered;
 	bool telemetry_group_registered;
+	// Carries the tt_hung latch control.  Registered unconditionally and
+	// kept separate from telemetry_group so the recovery handle survives a
+	// failed telemetry probe on an already-fenced die.
+	bool hang_group_registered;
 };
 
 #define tt_dev_to_bh_dev(ttdev) \
