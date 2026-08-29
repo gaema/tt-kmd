@@ -717,8 +717,141 @@ static ssize_t tt_hung_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(tt_hung);
 
+// AICLK pin (data-movement lever L5, route C).
+//
+// A non-metal consumer of the card -- a DMA tool, a host-to-host driver,
+// anything that does not open the device through tt-metal/UMD -- runs at the
+// IDLE AICLK (800 MHz on p150a).  The firmware's DVFS goes busy only when a
+// client sends AICLK_GO_BUSY, which UMD does at device open and nothing else
+// does.  Measured on p150a 2026-08-26: the identical D2H binary reads
+// 44.80 -> 58.61 GB/s (130.82%) when a metal process merely sits open beside
+// it.  So every absolute figure a non-metal path produces carries an unnamed
+// ~30% unless the clock is held, and until now the only holder was a metal
+// process.
+//
+// TT_SMC_MSG_FORCE_AICLK (0x33) pins AICLK to an exact MHz "regardless of any
+// limits" (aiclk_ppm.c): the TDP / thermal / voltage arbiters are bypassed
+// while pinned, which makes this an operator knob, never a default.  Writing
+// 0 releases the pin and hands the card back to the PPM.  TT_SMC_MSG_GET_AICLK
+// (0x34) reports the live clock and whether the PPM is uncontrolled / forced /
+// unforced.  Both messages are in the vendor firmware since at least v19.13.0.
+//
+// The pin is FIRMWARE state: it survives fd close and a module reload, and
+// clears only on a 0 write or an ASIC reset.  That is deliberate -- a harness
+// pins once, runs several tools, and unpins -- and it is why the pin is a
+// sysfs attribute rather than a per-fd ioctl.  The firmware range check is
+// mirrored here so an out-of-range write fails with -EINVAL instead of a
+// generic ARC refusal.
+#define ARC_MSG_TYPE_FORCE_AICLK 0x33
+#define ARC_MSG_TYPE_GET_AICLK 0x34
+#define BH_AICLK_FORCE_MIN_MHZ 200	// firmware AICLK_FMIN_MIN
+#define BH_AICLK_FORCE_MAX_MHZ 1400	// firmware AICLK_FMAX_MAX
+
+static bool send_arc_message(struct blackhole_device *bh, struct arc_msg *msg);
+
+// Serialises the sysfs-originated ARC messages against each other.  The
+// probe/reset paths that also use the queue run before the attributes exist
+// or under the ioctl's own exclusion.
+static DEFINE_MUTEX(bh_aiclk_msg_mutex);
+
+static ssize_t tt_aiclk_force_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", bh->aiclk_forced_mhz);
+}
+
+static ssize_t tt_aiclk_force_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+	struct arc_msg msg = { 0 };
+	unsigned int mhz;
+	bool ok;
+	int r;
+
+	r = kstrtouint(buf, 0, &mhz);
+	if (r)
+		return r;
+
+	if (mhz != 0 && (mhz < BH_AICLK_FORCE_MIN_MHZ || mhz > BH_AICLK_FORCE_MAX_MHZ))
+		return -EINVAL;
+
+	if (tt_dev->detached || bh_hung(bh))
+		return -EIO;
+
+	msg.header = ARC_MSG_TYPE_FORCE_AICLK;
+	msg.payload[0] = mhz;
+
+	mutex_lock(&bh_aiclk_msg_mutex);
+	ok = send_arc_message(bh, &msg);
+	mutex_unlock(&bh_aiclk_msg_mutex);
+
+	if (!ok) {
+		dev_warn(&tt_dev->pdev->dev,
+			 "FORCE_AICLK %u MHz not accepted (firmware refused, or ARC not answering)\n", mhz);
+		return -EIO;
+	}
+
+	bh->aiclk_forced_mhz = mhz;
+	if (mhz)
+		dev_info(&tt_dev->pdev->dev,
+			 "AICLK pinned at %u MHz via tt_aiclk_force; PPM limits are bypassed while pinned\n", mhz);
+	else
+		dev_info(&tt_dev->pdev->dev, "AICLK pin released via tt_aiclk_force; PPM resumes\n");
+
+	return count;
+}
+static DEVICE_ATTR_RW(tt_aiclk_force);
+
+static ssize_t tt_aiclk_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+	struct arc_msg msg = { 0 };
+	const char *mode;
+	bool ok;
+
+	if (tt_dev->detached || bh_hung(bh))
+		return -EIO;
+
+	msg.header = ARC_MSG_TYPE_GET_AICLK;
+
+	mutex_lock(&bh_aiclk_msg_mutex);
+	ok = send_arc_message(bh, &msg);
+	mutex_unlock(&bh_aiclk_msg_mutex);
+
+	if (!ok)
+		return -EIO;
+
+	// Response words: data[1] = AICLK in MHz, data[2] = clock mode
+	// (aiclk_ppm.c get_aiclk_handler); data[0] is the status the queue
+	// already consumed as msg.header.
+	switch (msg.payload[1]) {
+	case 1:
+		mode = "uncontrolled";	// DVFS disabled in firmware
+		break;
+	case 2:
+		mode = "forced";
+		break;
+	case 3:
+		mode = "unforced";
+		break;
+	default:
+		mode = "unknown";
+		break;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u %s\n", msg.payload[0], mode);
+}
+static DEVICE_ATTR_RO(tt_aiclk_mode);
+
 static struct attribute *bh_hang_attrs[] = {
 	ATTR_LIST(tt_hung),
+	ATTR_LIST(tt_aiclk_force),
+	ATTR_LIST(tt_aiclk_mode),
 	NULL,
 };
 

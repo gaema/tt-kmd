@@ -39,6 +39,11 @@ struct blackhole_device {
 	// kept separate from telemetry_group so the recovery handle survives a
 	// failed telemetry probe on an already-fenced die.
 	bool hang_group_registered;
+
+	// Last AICLK pin written through tt_aiclk_force (MHz; 0 = not pinned by
+	// us).  Mirrors firmware state we set, not a readback: the live clock and
+	// the PPM mode are on tt_aiclk / tt_aiclk_mode.
+	u32 aiclk_forced_mhz;
 };
 
 #define tt_dev_to_bh_dev(ttdev) \
