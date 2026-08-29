@@ -273,6 +273,8 @@ static u8 __iomem *bh_configure_kernel_tlb(struct blackhole_device *bh, u32 x, u
 //   answers.  That is the aipro ARC/NoC hang class; the first land of this
 //   latch incorrectly required the endpoint probe to agree, so it never
 //   armed and hwmon kept issuing TLB MMIO forever.
+static bool bh_endpoint_reset_under_us(struct blackhole_device *bh);
+
 static bool bh_endpoint_gone(struct blackhole_device *bh)
 {
 	struct pci_dev *pdev = bh->tt.pdev;
@@ -394,17 +396,78 @@ static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, in
 	if (arm) {
 		// Probe OUTSIDE the TLB mutex (must not convoy other NoC users
 		// behind a possibly-stalling BAR0 read).
-		const char *why = by_duration ?
-			"all-ones continuously past the dead-device bound, far longer than any measured ARC init" :
-			(bh_endpoint_gone(bh) ?
-				"endpoint/BAR dead" :
-				"TLB/NoC path dead (endpoint still answers BAR0)");
-		bh_set_hung(bh, why, streak);
+		//
+		// FIRST, rule out the case that is not a dead device at all.  The
+		// DMC resets the ASIC on its own (its ARC watchdog, a therm trip,
+		// ...) and that resets the PCIe endpoint too: config space comes
+		// back at power-on defaults -- COMMAND 0, every BAR base 0 -- while
+		// the kernel's struct resource still says f8_0000_0000.  Every BAR
+		// read then returns all-ones and this latch armed on a HEALTHY,
+		// freshly re-bootrommed chip.  Measured 2026-08-29 on all four p300c
+		// dies of tt-quietbox: vendor id answered, BAR0 register read
+		// 0x0000000c (base 0), NOC_ID live the instant the BARs were
+		// re-programmed by hand.  Upstream v2.9.0 has the same blind spot.
+		// So: if config space answers and BAR0's base is zero, restore the
+		// state saved at probe, drop the streak, and hand the caller -EIO
+		// to retry -- do NOT fence the device.
+		if (bh_endpoint_reset_under_us(bh)) {
+			mutex_lock(&bh->kernel_tlb_mutex);
+			bh->allones_streak = 0;
+			bh->allones_since = 0;
+			mutex_unlock(&bh->kernel_tlb_mutex);
+			bh->tt.needs_hw_init = true;
+			return -EIO;
+		}
+		{
+			const char *why = by_duration ?
+				"all-ones continuously past the dead-device bound, far longer than any measured ARC init" :
+				(bh_endpoint_gone(bh) ?
+					"endpoint/BAR dead" :
+					"TLB/NoC path dead (endpoint still answers BAR0)");
+			bh_set_hung(bh, why, streak);
+		}
 		return -EIO;
 	}
 
 	*value = val;
 	return 0;
+}
+
+// The endpoint was reset underneath the driver (DMC-initiated ASIC reset):
+// config space answers with our vendor id but sits at power-on defaults.  Detect
+// it by BAR0's base being zero while the kernel has a real assignment, and
+// repair it from the state pci_save_state() captured at probe.  Returns true
+// when a repair was performed.  Logs once per event.
+static bool bh_endpoint_reset_under_us(struct blackhole_device *bh)
+{
+	struct pci_dev *pdev = bh->tt.pdev;
+	u16 vendor_id, command;
+	u32 bar0;
+
+	if (pdev == NULL)
+		return false;
+	if (pci_read_config_word(pdev, PCI_VENDOR_ID, &vendor_id) != PCIBIOS_SUCCESSFUL ||
+	    vendor_id != PCI_VENDOR_ID_TENSTORRENT)
+		return false;			// really gone (or link down): let the latch decide
+	if (pci_read_config_dword(pdev, PCI_BASE_ADDRESS_0, &bar0) != PCIBIOS_SUCCESSFUL)
+		return false;
+	pci_read_config_word(pdev, PCI_COMMAND, &command);
+	if ((bar0 & PCI_BASE_ADDRESS_MEM_MASK) != 0 && (command & PCI_COMMAND_MEMORY))
+		return false;			// BAR programmed and decoding: not this case
+
+	if (!safe_pci_restore_state(pdev)) {
+		dev_warn(&pdev->dev,
+			 "endpoint config space is at defaults (BAR0=0x%08x CMD=0x%04x) but no saved "
+			 "state to restore; leaving it to the liveness latch\n", bar0, command);
+		return false;
+	}
+	pci_read_config_dword(pdev, PCI_BASE_ADDRESS_0, &bar0);
+	pci_read_config_word(pdev, PCI_COMMAND, &command);
+	dev_warn(&pdev->dev,
+		 "endpoint was reset underneath us (DMC-initiated ASIC reset?): config space was at "
+		 "defaults; restored BARs/COMMAND from saved state (BAR0=0x%08x CMD=0x%04x). "
+		 "Hardware will re-init on next open.\n", bar0, command);
+	return true;
 }
 
 static int noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value)
@@ -923,7 +986,7 @@ static void blackhole_last_release(struct tenstorrent_device *tt_dev)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	struct arc_msg msg = { 0 };
-	u32 telem_ptr;
+	u32 telem_ptr, boot_status, hb0, hb1;
 
 	if (!reset_on_last_close)
 		return;
@@ -932,11 +995,35 @@ static void blackhole_last_release(struct tenstorrent_device *tt_dev)
 	if (tt_dev->detached || tt_dev->needs_hw_init)
 		return;
 
-	if (noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_PTR, 0, &telem_ptr) != 0 ||
+	// 2026-08-29, MEASURED: the pointer test alone is NOT enough.  RESET_UNIT
+	// scratch RAM is not cleared by an ASIC reset, so after a DMC re-bootrom
+	// the previous run's telemetry pointer is still there and this gate passed
+	// on a chip that had NOT reached init_telemetry() yet.  The REINIT went
+	// out, TensixInit's broadcast NoC write never completed, and the DMC's
+	// JTAG capture put the ARC at 0x1002BF80 = WriteReg <- NOC2AXIWrite32 in
+	// tensix_inject_instruction, on all four p300c dies.  So require, in
+	// addition, that msg_queue_ready is set for THIS boot and that the
+	// telemetry heartbeat is actually advancing -- a counter only the running
+	// telemetry timer bumps, which no stale scratch value can fake.
+	if (noc_read32(bh, ARC_X, ARC_Y, ARC_BOOT_STATUS, 0, &boot_status) != 0 ||
+	    boot_status == 0xFFFFFFFFu || !(boot_status & ARC_BOOT_STATUS_READY_FOR_MSG) ||
+	    noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_PTR, 0, &telem_ptr) != 0 ||
 	    !is_range_within_csm(telem_ptr, 1)) {
 		dev_warn(&tt_dev->pdev->dev,
 			 "last-close grid re-init skipped; ARC has not finished init "
-			 "(telemetry table not published). Re-init here would take the NoC down.\n");
+			 "(queue/telemetry not published). Re-init here would take the NoC down.\n");
+		return;
+	}
+	if (blackhole_read_telemetry_tag(tt_dev, TELEMETRY_TIMER_HEARTBEAT, &hb0) != 0) {
+		dev_warn(&tt_dev->pdev->dev,
+			 "last-close grid re-init skipped; telemetry heartbeat unreadable.\n");
+		return;
+	}
+	msleep(60);
+	if (blackhole_read_telemetry_tag(tt_dev, TELEMETRY_TIMER_HEARTBEAT, &hb1) != 0 || hb1 == hb0) {
+		dev_warn(&tt_dev->pdev->dev,
+			 "last-close grid re-init skipped; ARC telemetry heartbeat not advancing "
+			 "(%u -> %u). Re-init here would take the NoC down.\n", hb0, hb1);
 		return;
 	}
 

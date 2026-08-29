@@ -67,10 +67,19 @@ MODULE_PARM_DESC(idle_power_down_grace_ms,
 		 "synchronously at close.  Only honored by device classes "
 		 "that opt in via defer_idle_powerdown.");
 
-bool reset_on_last_close = true;
+// DEFAULT OFF since 2026-08-29 (upstream parity: upstream never sends this).
+// Measured on tt-quietbox: REINIT_TENSIX issued to a freshly PERST-booted p300c
+// hung the ARC at 0x1002BF80 (WriteReg <- NOC2AXIWrite32 inside
+// tensix_inject_instruction, TensixInit's broadcast) on all four dies, the DMC
+// watchdog then reset the ASIC, and the endpoint came back with its config
+// space at defaults -- the whole "four dead dies" wedge of 2026-08-28.  The
+// re-init is a wedge-PREVENTION nicety; on an unready chip it is the wedge.
+// Opt in with reset_on_last_close=1; the gate in blackhole_last_release()
+// then still requires a live, heartbeat-advancing ARC.
+bool reset_on_last_close = false;
 module_param(reset_on_last_close, bool, 0644);
 MODULE_PARM_DESC(reset_on_last_close,
-		 "On the last fd closing a device, re-initialize the Tensix "
+		 "DEFAULT OFF. On the last fd closing a device, re-initialize the Tensix "
 		 "grid + NoC so a process killed mid-init (SIGKILL/OOM) does "
 		 "not wedge the device for the next opener.  Only honored by "
 		 "device classes that opt in via last_release_cb (Blackhole). "
