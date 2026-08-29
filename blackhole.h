@@ -24,6 +24,13 @@ struct blackhole_device {
 	// answers.  allones_streak is only touched under kernel_tlb_mutex;
 	// hung is atomic and tested before taking that mutex.
 	unsigned int allones_streak;
+	// First jiffies at which ARC_BOOT_STATUS read all-ones with no good read
+	// since; 0 when not in an all-ones run.  The ARC-ready poll cannot use a
+	// read COUNT to tell "still booting" from "dead" -- a healthy ARC reads
+	// all-ones for its whole SYS_INIT (measured up to 35.9 s) and a tight
+	// poll racks up thousands of reads in that window.  Duration separates
+	// them.  Touched only under kernel_tlb_mutex.
+	unsigned long allones_since;
 	atomic_t hung;
 
 	bool pcie_perf_group_registered;

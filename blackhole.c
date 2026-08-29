@@ -65,6 +65,14 @@
 #define ARC_MSG_QCB_PTR RESET_SCRATCH(11) // Message Queue Control Block
 #define ARC_MSI_FIFO 0x800B0000           // Write 0 to trigger the ARC message queue processor
 #define ARC_MSG_READY_MS 500              // Wait this long for ARC to be ready for message queue operations
+// How long ARC_BOOT_STATUS may read all-ones CONTINUOUSLY before the device is
+// declared dead on the latch-neutral poll path.  Must exceed the worst real ARC
+// init by a wide margin: measured worst post-reset init is 35.9 s (host-observed,
+// ai/tenstorrent/blackhole/design/power/audit/2026-08-10-dmc-arc-boot-guard.md),
+// so 120 s is ~3.3x that.  Overshooting only delays fencing a dead die;
+// undershooting fences a healthy one that is still booting, which is the exact
+// regression this whole path exists to avoid.
+#define BH_ARC_ALLONES_DEAD_MS 120000
 #define ARC_MSG_TYPE_ASIC_STATE0 0xA0
 #define ARC_MSG_TYPE_ASIC_STATE3 0xA3
 #define ARC_MSG_TYPE_SET_WDT_TIMEOUT 0xC1
@@ -341,6 +349,7 @@ static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, in
 	u8 __iomem *tlb_window;
 	unsigned int streak = 0;
 	bool arm = false;
+	bool by_duration = false;
 
 	if (bh_hung(bh))
 		return -EIO;
@@ -357,10 +366,27 @@ static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, in
 
 	if (val != 0xFFFFFFFFu) {
 		bh->allones_streak = 0;
-	} else if (count_allones && bh_hung_threshold != 0) {
+		bh->allones_since = 0;
+	} else if (bh_hung_threshold == 0) {
+		// Latch disabled entirely.
+	} else if (count_allones) {
 		streak = ++bh->allones_streak;
 		if (streak >= bh_hung_threshold)
 			arm = true;
+	} else {
+		// Latch-neutral READ, duration-armed DEVICE.  A read count cannot
+		// separate "still booting" from "dead" on this path -- a healthy
+		// ARC is all-ones for its whole SYS_INIT and the caller polls it
+		// tightly -- but elapsed time can.  Past the bound the device has
+		// had far longer than any measured init and is not coming back, so
+		// stop the MMIO rather than poll a corpse forever.
+		if (bh->allones_since == 0) {
+			bh->allones_since = jiffies ? jiffies : 1;
+		} else if (time_after(jiffies, bh->allones_since +
+					      msecs_to_jiffies(BH_ARC_ALLONES_DEAD_MS))) {
+			arm = true;
+			by_duration = true;
+		}
 	}
 
 	mutex_unlock(&bh->kernel_tlb_mutex);
@@ -368,9 +394,11 @@ static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, in
 	if (arm) {
 		// Probe OUTSIDE the TLB mutex (must not convoy other NoC users
 		// behind a possibly-stalling BAR0 read).
-		const char *why = bh_endpoint_gone(bh) ?
-			"endpoint/BAR dead" :
-			"TLB/NoC path dead (endpoint still answers BAR0)";
+		const char *why = by_duration ?
+			"all-ones continuously past the dead-device bound, far longer than any measured ARC init" :
+			(bh_endpoint_gone(bh) ?
+				"endpoint/BAR dead" :
+				"TLB/NoC path dead (endpoint still answers BAR0)");
 		bh_set_hung(bh, why, streak);
 		return -EIO;
 	}
