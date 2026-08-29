@@ -442,18 +442,28 @@ static bool bh_endpoint_reset_under_us(struct blackhole_device *bh)
 {
 	struct pci_dev *pdev = bh->tt.pdev;
 	u16 vendor_id, command;
-	u32 bar0;
+	u32 bar0, bar0_hi;
+	u64 base, expected;
 
 	if (pdev == NULL)
 		return false;
 	if (pci_read_config_word(pdev, PCI_VENDOR_ID, &vendor_id) != PCIBIOS_SUCCESSFUL ||
 	    vendor_id != PCI_VENDOR_ID_TENSTORRENT)
 		return false;			// really gone (or link down): let the latch decide
-	if (pci_read_config_dword(pdev, PCI_BASE_ADDRESS_0, &bar0) != PCIBIOS_SUCCESSFUL)
+	if (pci_read_config_dword(pdev, PCI_BASE_ADDRESS_0, &bar0) != PCIBIOS_SUCCESSFUL ||
+	    pci_read_config_dword(pdev, PCI_BASE_ADDRESS_1, &bar0_hi) != PCIBIOS_SUCCESSFUL)
 		return false;
 	pci_read_config_word(pdev, PCI_COMMAND, &command);
-	if ((bar0 & PCI_BASE_ADDRESS_MEM_MASK) != 0 && (command & PCI_COMMAND_MEMORY))
-		return false;			// BAR programmed and decoding: not this case
+	// BAR0 is a 64-bit BAR whose base is 4 GiB aligned on these hosts, so its
+	// LOW dword reads 0x0000000c on a perfectly healthy device -- testing the
+	// low dword alone would call every latch event a reset.  Compare the full
+	// 64-bit base against what the kernel assigned.
+	base = ((u64)bar0_hi << 32) | (bar0 & PCI_BASE_ADDRESS_MEM_MASK);
+	expected = pci_resource_start(pdev, 0);
+	if (base == expected && (command & PCI_COMMAND_MEMORY))
+		return false;			// BAR programmed as assigned and decoding: not this case
+	if (base != 0 && base != expected)
+		return false;			// programmed to something else entirely: not our case either
 
 	if (!safe_pci_restore_state(pdev)) {
 		dev_warn(&pdev->dev,
