@@ -900,10 +900,30 @@ static bool blackhole_reset(struct tenstorrent_device *tt_dev, u32 reset_flag)
 // deeper recovery is the DMC-side auto-reset watchdog (sideband, not NoC),
 // which is out of scope for this last-close path.  Never crash the release
 // path: this runs under chardev_mutex with no fd to return an error to.
+//
+// NEVER send it to an ARC that has not FINISHED init.  A message queue that
+// answers is not proof the ARC is healthy: CMFW services the queue from the
+// system workqueue (prio -1), which preempts a main thread (prio 0) stalled
+// inside SYS_INIT.  So a chip stuck in bh_arc_init_end() -- e.g. the unbounded
+// PVT sdif_busy wait in init_telemetry(), which sits AFTER init_msgqueue() --
+// happily accepts REINIT_TENSIX, runs ClearNocTranslation()/NocInit()/
+// TensixInit() underneath a half-initialised chip, and the NoC goes all-ones
+// for good.  Measured 2026-08-28 on tt-quietbox: msg_queue_ready set, our
+// last-close REINIT pushed at t~72, NoC dark at t=74, on all four p300c dies;
+// upstream's kmd never sends this message, so upstream sees only the stall.
+//
+// The gate is the telemetry table pointer.  init_telemetry() publishes
+// TELEMETRY_TABLE_REG_ADDR (RESET_SCRATCH(13)) only AFTER its first
+// update_telemetry(), i.e. after the PVT reads -- so a pointer that points into
+// CSM proves the ARC got past the last unbounded wait in SYS_INIT.  Read it
+// LIVE here rather than trusting the probe-time result: on a healthy boot the
+// probe at t~7 s runs before the ARC is up and fails, while by last-close the
+// ARC is long finished.
 static void blackhole_last_release(struct tenstorrent_device *tt_dev)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
 	struct arc_msg msg = { 0 };
+	u32 telem_ptr;
 
 	if (!reset_on_last_close)
 		return;
@@ -911,6 +931,14 @@ static void blackhole_last_release(struct tenstorrent_device *tt_dev)
 	// Device is gone or mid-reset: nothing safe to talk to.
 	if (tt_dev->detached || tt_dev->needs_hw_init)
 		return;
+
+	if (noc_read32(bh, ARC_X, ARC_Y, ARC_TELEMETRY_PTR, 0, &telem_ptr) != 0 ||
+	    !is_range_within_csm(telem_ptr, 1)) {
+		dev_warn(&tt_dev->pdev->dev,
+			 "last-close grid re-init skipped; ARC has not finished init "
+			 "(telemetry table not published). Re-init here would take the NoC down.\n");
+		return;
+	}
 
 	msg.header = ARC_MSG_TYPE_REINIT_TENSIX;
 	if (!send_arc_message(bh, &msg))
