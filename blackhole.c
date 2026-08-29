@@ -328,12 +328,19 @@ static void bh_clear_hung(struct blackhole_device *bh)
 // latch the device.  Threshold 0 disables the latch.  Confirmation against
 // BAR0/config is classification-only (log string), never a veto: an ARC/NoC
 // hang with a live endpoint still produces TLB all-ones and must arm.
-static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value, bool nowait)
+//
+// count_allones=false makes the read latch-NEUTRAL: the streak is neither
+// advanced nor consulted.  It exists for callers that POLL a register whose
+// all-ones value is an expected transient rather than evidence of death --
+// see send_arc_message(), which waits for an ARC that is still booting.
+// A good read still clears the streak in either mode.
+static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value,
+			 bool nowait, bool count_allones)
 {
 	u32 val;
 	u8 __iomem *tlb_window;
 	unsigned int streak = 0;
-	bool latch = false;
+	bool arm = false;
 
 	if (bh_hung(bh))
 		return -EIO;
@@ -350,15 +357,15 @@ static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, in
 
 	if (val != 0xFFFFFFFFu) {
 		bh->allones_streak = 0;
-	} else if (bh_hung_threshold != 0) {
+	} else if (count_allones && bh_hung_threshold != 0) {
 		streak = ++bh->allones_streak;
 		if (streak >= bh_hung_threshold)
-			latch = true;
+			arm = true;
 	}
 
 	mutex_unlock(&bh->kernel_tlb_mutex);
 
-	if (latch) {
+	if (arm) {
 		// Probe OUTSIDE the TLB mutex (must not convoy other NoC users
 		// behind a possibly-stalling BAR0 read).
 		const char *why = bh_endpoint_gone(bh) ?
@@ -374,14 +381,21 @@ static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, in
 
 static int noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value)
 {
-	return bh_noc_read32(bh, x, y, addr, noc, value, false);
+	return bh_noc_read32(bh, x, y, addr, noc, value, false, true);
+}
+
+// Latch-neutral variant for POLLING a not-yet-ready device.  See the
+// count_allones note on bh_noc_read32().
+static int noc_read32_nolatch(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value)
+{
+	return bh_noc_read32(bh, x, y, addr, noc, value, false, false);
 }
 
 // Telemetry-path variant: never queue behind another NoC user.  See the
 // comment on blackhole_read_telemetry_tag().
 static int noc_read32_nowait(struct blackhole_device *bh, u32 x, u32 y, u64 addr, int noc, u32 *value)
 {
-	return bh_noc_read32(bh, x, y, addr, noc, value, true);
+	return bh_noc_read32(bh, x, y, addr, noc, value, true, true);
 }
 
 // Returns 0 on success, -EIO if the device is latched hung (no MMIO issued).
@@ -757,13 +771,26 @@ static bool send_arc_message(struct blackhole_device *bh, struct arc_msg *msg)
 	unsigned long timeout = jiffies + msecs_to_jiffies(ARC_MSG_READY_MS);
 
 	do {
-		if (noc_read32(bh, ARC_X, ARC_Y, ARC_BOOT_STATUS, 0, &boot_status) != 0)
-			return false; // device latched hung, or MMIO refused
+		// Latch-NEUTRAL read: this loop is WAITING for the ARC, and an ARC
+		// that has not finished SYS_INIT reads all-ones on ARC_BOOT_STATUS.
+		// That is its normal pre-init value, not evidence of death, so it
+		// must neither advance nor trip the liveness latch.
+		if (noc_read32_nolatch(bh, ARC_X, ARC_Y, ARC_BOOT_STATUS, 0, &boot_status) != 0)
+			return false; // already latched hung, or MMIO refused
 		if (boot_status == 0xFFFFFFFFu) {
-			// Single all-ones on the ARC boot status is already the
-			// driver's historical "NOC is hung" signal; arm the latch
-			// so subsequent hwmon/ioctl paths stop issuing MMIO.
-			bh_set_hung(bh, "ARC_BOOT_STATUS all-ones", 0);
+			// Upstream behaviour: a RETRYABLE failure.  Do NOT latch here.
+			// ARC init is measured at up to 35.9 s worst case while this
+			// wait is ARC_MSG_READY_MS (500 ms, upstream's value), so the
+			// device is routinely not ready on the first calls after a
+			// reset or a host boot.  Latching on that turned "not up yet"
+			// into "permanently dead": every subsequent MMIO was refused
+			// device-wide, including the recovery paths, so the ARC would
+			// finish booting into a driver that would no longer talk to it.
+			// A genuinely dead device still latches via the streak path on
+			// the hwmon/telemetry/ioctl reads, which is what that path is
+			// for.  Measured 2026-08-29: p150a on aipro failed this way on
+			// some boots and not others; p300c on tt-quietbox is a real
+			// hang and latches correctly through the streak path.
 			return false;
 		}
 		if (boot_status & ARC_BOOT_STATUS_READY_FOR_MSG)
