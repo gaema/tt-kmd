@@ -22,8 +22,14 @@ struct tenstorrent_device;
 
 /* Bumped on ANY incompatible change below.  tt_h2h compares this compile-time
  * constant against the running driver's tenstorrent_h2h_abi_version() and
- * refuses to bind on a mismatch. */
-#define TENSTORRENT_H2H_ABI_VERSION 1u
+ * refuses to bind on a mismatch.
+ *
+ * v2 (M2): + tenstorrent_h2h_dma_dev().  Adding a symbol is compatible in the
+ * old-tt_h2h-on-new-tt-kmd direction and NOT in the other, which is the
+ * direction that bites: a v2 tt_h2h against a resident v1 tenstorrent.ko fails
+ * at insmod on an unknown symbol.  Bumping makes that a named ABI refusal
+ * instead.  Rebuild AND reload tenstorrent.ko when this moves. */
+#define TENSTORRENT_H2H_ABI_VERSION 2u
 
 unsigned int tenstorrent_h2h_abi_version(void);
 
@@ -31,6 +37,23 @@ unsigned int tenstorrent_h2h_abi_version(void);
  * NULL if absent or detached; otherwise release with put_device(). */
 struct tenstorrent_device *tenstorrent_h2h_get_device(unsigned int ordinal);
 void tenstorrent_h2h_put_device(struct tenstorrent_device *tt_dev);
+
+/* The device DMA mappings must be created against -- i.e. &tt_dev->pdev->dev.
+ * NULL if the device has detached.
+ *
+ * 🔴 WHY THIS IS HERE AND NOT IN tt_h2h.  An MR's IOVA is not a property of the
+ * pages; it is a property of the DMA path the CARD will use to reach them, so
+ * it can only be produced by dma_map against the card's own struct device.
+ * tt_h2h has no other way to name that device, and the alternative -- treating
+ * page_to_phys() as an IOVA -- is silently WRONG the moment an IOMMU is
+ * translating, which is exactly the class of bug that is invisible in testing
+ * on a passthrough host and corrupts memory on a translating one.  Two lines
+ * here beat a masked bug there.
+ *
+ * The reference belongs to tt_dev: the caller must hold its
+ * tenstorrent_h2h_get_device() reference for as long as it uses this pointer,
+ * and must not put_device() it separately. */
+struct device *tenstorrent_h2h_dma_dev(struct tenstorrent_device *tt_dev);
 
 /* 32-bit NOC accessors.  0 on success, -ENODEV if the class has no op or the
  * device detached, -EINVAL on a bad argument, -EIO on an incomplete read.

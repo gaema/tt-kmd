@@ -74,6 +74,21 @@ void tenstorrent_h2h_put_device(struct tenstorrent_device *tt_dev)
 }
 EXPORT_SYMBOL_GPL(tenstorrent_h2h_put_device);
 
+// The struct device DMA mappings are created against.  See the header for why
+// this is a shim export rather than something tt_h2h derives for itself.
+//
+// No reference is taken: the pointer is valid for as long as the caller's
+// tenstorrent_h2h_get_device() reference is, and taking a second one here would
+// invite a caller to release the wrong one.
+struct device *tenstorrent_h2h_dma_dev(struct tenstorrent_device *tt_dev)
+{
+	if (!tt_dev || tt_dev->detached || !tt_dev->pdev)
+		return NULL;
+
+	return &tt_dev->pdev->dev;
+}
+EXPORT_SYMBOL_GPL(tenstorrent_h2h_dma_dev);
+
 // 32-bit NOC read.  Returns 0 on success, -EIO if the read did not complete,
 // -ENODEV if this device class has no NOC read op (Wormhole today) or the
 // device has detached since lookup.
