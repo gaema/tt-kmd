@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 obj-m += tenstorrent.o
-tenstorrent-y := module.o chardev.o enumerate.o interrupt.o wormhole.o blackhole.o msgqueue.o pcie.o sg_helpers.o memory.o tlb.o telemetry.o
+tenstorrent-y := module.o chardev.o enumerate.o interrupt.o wormhole.o blackhole.o msgqueue.o pcie.o sg_helpers.o memory.o tlb.o telemetry.o gaema_h2h_shim.o
 
 # Build identity embedded in the .ko as MODULE_INFO(gaema_build, ...).  Resolved
 # in both build contexts: $(src) is set by kbuild, $(CURDIR) applies when this

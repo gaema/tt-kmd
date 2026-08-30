@@ -481,6 +481,23 @@ void tenstorrent_device_put(struct tenstorrent_device *tt_dev) {
 	kref_put(&tt_dev->kref, tt_dev_release);
 }
 
+// gaema: look up a device by ordinal and take a reference, for the h2h shim.
+// The xarray stays private to this file -- callers get a refcounted device or
+// NULL, never the container.  Under xa_lock so a concurrent xa_erase() from
+// tenstorrent_pci_remove() cannot free the entry between the load and the
+// kref_get; that race is the whole reason this is not a bare xa_load().
+struct tenstorrent_device *tenstorrent_lookup_device(unsigned int ordinal) {
+	struct tenstorrent_device *tt_dev;
+
+	xa_lock(&tenstorrent_dev_xa);
+	tt_dev = xa_load(&tenstorrent_dev_xa, ordinal);
+	if (tt_dev)
+		kref_get(&tt_dev->kref);
+	xa_unlock(&tenstorrent_dev_xa);
+
+	return tt_dev;
+}
+
 static int tenstorrent_suspend(struct device *dev) {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct tenstorrent_device *tt_dev = pci_get_drvdata(pdev);

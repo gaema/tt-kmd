@@ -1430,6 +1430,20 @@ static void blackhole_noc_write32(struct tenstorrent_device *tt_dev, u32 x, u32 
 	(void)noc_write32(bh, x, y, addr, data, noc);
 }
 
+// gaema: class-level NOC read, the counterpart of blackhole_noc_write32.
+// Deliberately the LATCHING variant (plain noc_read32, not _nolatch): an
+// all-ones read here is exactly the host-hang signature the liveness latch
+// exists to catch, and the h2h preflight is a cold-path call where paying that
+// check is correct.  A preflight that silently accepted 0xFFFFFFFF as the TXQ
+// cap would refuse every claim on a dead card with a confusing message instead
+// of the driver's own hang report.
+static int blackhole_noc_read32(struct tenstorrent_device *tt_dev, u32 x, u32 y, u64 addr, int noc, u32 *value)
+{
+	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
+
+	return noc_read32(bh, x, y, addr, noc, value);
+}
+
 static int blackhole_set_power_state(struct tenstorrent_device *tt_dev, struct tenstorrent_power_state *power_state)
 {
 	struct blackhole_device *bh = tt_dev_to_bh_dev(tt_dev);
@@ -1472,6 +1486,7 @@ struct tenstorrent_device_class blackhole_class = {
 	.restore_reset_state = blackhole_restore_reset_state,
 	.configure_outbound_atu = blackhole_configure_outbound_atu,
 	.noc_write32 = blackhole_noc_write32,
+	.noc_read32 = blackhole_noc_read32,	// gaema h2h shim
 	.csm_read32 = blackhole_csm_read32,
 	.csm_write32 = blackhole_csm_write32,
 	.set_power_state = blackhole_set_power_state,

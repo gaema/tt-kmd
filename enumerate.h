@@ -23,6 +23,12 @@ struct cdev;
 int tenstorrent_pci_register_driver(void);
 void tenstorrent_pci_unregister_driver(void);
 
+// gaema: refcounted lookup by /dev/tenstorrent/<ordinal> ordinal, for the h2h
+// shim.  Returns NULL if absent; every non-NULL return needs a matching
+// tenstorrent_device_put().
+struct tenstorrent_device;
+struct tenstorrent_device *tenstorrent_lookup_device(unsigned int ordinal);
+
 // Procfs show function for pids
 int pids_proc_show(struct seq_file *s, void *v);
 

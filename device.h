@@ -103,6 +103,15 @@ struct tenstorrent_device_class {
 	void (*restore_reset_state)(struct tenstorrent_device *ttdev);
 	int (*configure_outbound_atu)(struct tenstorrent_device *ttdev, u32 region, u64 base, u64 limit, u64 target);
 	void (*noc_write32)(struct tenstorrent_device *ttdev, u32 x, u32 y, u64 addr, u32 data, int noc);
+	// gaema: the read counterpart of noc_write32.  Upstream has only the
+	// write, because nothing in-tree needed a NOC read through the class --
+	// the reads it does have are ARC/CSM-scoped (csm_read32).  The h2h
+	// wedge preflight needs an ARBITRARY-tile read (an ETH tile's TXQ cap
+	// and the firmware's own ETH_PARAM word), so the op is added rather
+	// than routed through csm_read32, which cannot address one.
+	// Returns 0 on success, negative errno on a read that did not complete.
+	// NULL on a class that has no implementation -- callers must check.
+	int (*noc_read32)(struct tenstorrent_device *ttdev, u32 x, u32 y, u64 addr, int noc, u32 *value);
 	int (*csm_read32)(struct tenstorrent_device *ttdev, u64 addr, u32 *value);
 	int (*csm_write32)(struct tenstorrent_device *ttdev, u64 addr, u32 value);
 	int (*set_power_state)(struct tenstorrent_device *ttdev, struct tenstorrent_power_state *power_state);
