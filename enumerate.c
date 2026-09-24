@@ -315,6 +315,10 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 
 	mutex_init(&tt_dev->chardev_mutex);
 	mutex_init(&tt_dev->iatu_mutex);
+	spin_lock_init(&tt_dev->msi_lock);
+	tt_dev->msi_eventfd = NULL;
+	tt_dev->msi_owner = NULL;
+	atomic64_set(&tt_dev->irq_count, 0);
 	INIT_DELAYED_WORK(&tt_dev->power_down_work, tenstorrent_power_down_work_func);
 
 	// Use dma_address_bits from module parameter or device class for coherent

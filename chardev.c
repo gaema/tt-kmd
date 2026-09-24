@@ -20,6 +20,7 @@
 #include "chardev_private.h"
 #include "device.h"
 #include "enumerate.h"
+#include "interrupt.h"
 #include "ioctl.h"
 #include "pcie.h"
 #include "memory.h"
@@ -535,6 +536,36 @@ void tenstorrent_power_down_work_func(struct work_struct *work)
 	tenstorrent_set_aggregated_power_state(tt_dev);
 }
 
+static long ioctl_set_msi_eventfd(struct chardev_private *priv,
+				  struct tenstorrent_set_msi_eventfd __user *arg)
+{
+	struct tenstorrent_device *tt_dev = priv->device;
+	struct tenstorrent_set_msi_eventfd data;
+	u32 argsz;
+	int ret;
+
+	if (get_user(argsz, &arg->argsz))
+		return -EFAULT;
+	if (argsz < sizeof(data))
+		return -EINVAL;
+	if (copy_from_user(&data, arg, sizeof(data)))
+		return -EFAULT;
+	if (data.flags != 0)
+		return -EINVAL;
+
+	ret = tenstorrent_set_msi_eventfd(tt_dev, priv, data.eventfd);
+	if (ret)
+		return ret;
+
+	tenstorrent_msi_info(tt_dev, &data.irq_type, &data.msi_address, &data.msi_data);
+	data.reserved0 = 0;
+	data.irq_count = atomic64_read(&tt_dev->irq_count);
+
+	if (copy_to_user(arg, &data, sizeof(data)))
+		return -EFAULT;
+	return 0;
+}
+
 static long ioctl_set_power_state(struct chardev_private *priv, struct tenstorrent_power_state __user *arg)
 {
 	struct tenstorrent_device *tt_dev = priv->device;
@@ -661,6 +692,10 @@ static long tt_cdev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 		case TENSTORRENT_IOCTL_SET_POWER_STATE:
 			ret = ioctl_set_power_state(priv, (struct tenstorrent_power_state __user *)arg);
+			break;
+
+		case TENSTORRENT_IOCTL_SET_MSI_EVENTFD:
+			ret = ioctl_set_msi_eventfd(priv, (struct tenstorrent_set_msi_eventfd __user *)arg);
 			break;
 
 		default:
@@ -876,6 +911,7 @@ static int tt_cdev_release(struct inode *inode, struct file *file)
 	down_read(&tt_dev->reset_rwsem);
 
 	tt_cdev_release_noc_cleanup(priv);
+	tenstorrent_release_msi_eventfd(tt_dev, priv);
 	decrement_cdev_open_count(tt_dev);
 	tenstorrent_memory_cleanup(priv);
 	tt_cdev_release_resource_locks(priv);

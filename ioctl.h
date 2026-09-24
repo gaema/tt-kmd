@@ -27,6 +27,7 @@
 #define TENSTORRENT_IOCTL_CONFIGURE_TLB		_IO(TENSTORRENT_IOCTL_MAGIC, 13)
 #define TENSTORRENT_IOCTL_SET_NOC_CLEANUP		_IO(TENSTORRENT_IOCTL_MAGIC, 14)
 #define TENSTORRENT_IOCTL_SET_POWER_STATE		_IO(TENSTORRENT_IOCTL_MAGIC, 15)
+#define TENSTORRENT_IOCTL_SET_MSI_EVENTFD		_IO(TENSTORRENT_IOCTL_MAGIC, 16)
 
 // For tenstorrent_mapping.mapping_id. These are not array indices.
 #define TENSTORRENT_MAPPING_UNUSED		0
@@ -407,6 +408,40 @@ struct tenstorrent_power_state {
 #define TT_POWER_FLAG_TENSIX_ENABLE     (1U << 2) /* 1=Enable Tensix, 0=Clock Gate Tensix */
 #define TT_POWER_FLAG_L2CPU_ENABLE      (1U << 3) /* 1=Enable L2CPU,  0=Clock Gate L2CPU */
 	__u16 power_settings[14];
+};
+
+/**
+ * TENSTORRENT_IOCTL_SET_MSI_EVENTFD - Signal an eventfd on every device interrupt
+ *
+ * Lets a host process sleep until the card raises its interrupt (for example an
+ * L2CPU guest writing the PCIe tile's MSI doorbell, the same NOC write the ARC
+ * firmware uses), instead of polling BAR memory. One eventfd per device; the fd
+ * that registered it owns it, and it is dropped when that fd closes.
+ *
+ * In:
+ * @argsz: Must be >= sizeof(struct tenstorrent_set_msi_eventfd).
+ * @flags: Reserved, must be 0.
+ * @eventfd: An eventfd file descriptor to signal, or -1 to unregister.
+ *
+ * Out:
+ * @irq_type: 0 = no interrupt, 1 = INTx, 2 = MSI, 3 = MSI-X.
+ * @msi_address: For MSI, the address a device write must target to raise the
+ *               interrupt (the value programmed in the MSI capability).
+ * @msi_data: For MSI, the data word that write must carry.
+ * @irq_count: Interrupts handled on this device since the driver loaded.
+ *
+ * Returns -EBUSY if another fd owns the eventfd, -ENODEV if interrupts are not
+ * enabled on the device.
+ */
+struct tenstorrent_set_msi_eventfd {
+	__u32 argsz;
+	__u32 flags;
+	__s32 eventfd;
+	__u32 irq_type;
+	__u64 msi_address;
+	__u32 msi_data;
+	__u32 reserved0;
+	__u64 irq_count;
 };
 
 #endif

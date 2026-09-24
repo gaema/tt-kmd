@@ -13,6 +13,10 @@
 #include <linux/rwsem.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <linux/spinlock.h>
+#include <linux/atomic.h>
+
+struct eventfd_ctx;
 
 #include "ioctl.h"
 #include "memory.h"
@@ -39,6 +43,12 @@ struct tenstorrent_device {
 	unsigned int ordinal;
 	bool dma_capable;
 	bool interrupt_enabled;
+
+	// TENSTORRENT_IOCTL_SET_MSI_EVENTFD: signalled from the IRQ handler.
+	spinlock_t msi_lock;		// protects msi_eventfd and msi_owner
+	struct eventfd_ctx *msi_eventfd;
+	void *msi_owner;		// struct chardev_private * that registered it
+	atomic64_t irq_count;
 
 	struct mutex chardev_mutex;
 	unsigned int chardev_open_count;
