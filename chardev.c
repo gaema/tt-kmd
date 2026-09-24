@@ -500,7 +500,11 @@ static int tenstorrent_set_aggregated_power_state_locked(struct tenstorrent_devi
 	// Always send maximum validity (15 flags, max_settings_count settings) to
 	// firmware. This ensures FW applies all bits of the aggregated power_flags,
 	// regardless of what validity individual FDs specified.
-	power_state.validity = TT_POWER_VALIDITY(15, max_settings_count);
+	// l2cpu_power_hands_off: stop the flag count at the L2CPU flag's index, so
+	// FW applies AICLK/MRISC/Tensix and skips the L2CPU domain (whose handler
+	// reprograms the shared L2CPU PLL even when nothing changed).
+	power_state.validity = TT_POWER_VALIDITY(l2cpu_power_hands_off ? __ffs(TT_POWER_FLAG_L2CPU_ENABLE) : 15,
+						 max_settings_count);
 
 	return tt_dev->dev_class->set_power_state(tt_dev, &power_state);
 }

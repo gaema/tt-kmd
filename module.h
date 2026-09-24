@@ -34,6 +34,7 @@ extern bool power_policy;
 extern uint idle_power_down_grace_ms;
 extern bool reset_on_last_close;
 extern uint bh_hung_threshold;
+extern bool l2cpu_power_hands_off;
 
 extern struct tenstorrent_device_class wormhole_class;
 extern struct tenstorrent_device_class blackhole_class;

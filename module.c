@@ -85,6 +85,23 @@ MODULE_PARM_DESC(reset_on_last_close,
 		 "device classes that opt in via last_release_cb (Blackhole). "
 		 "Default on.");
 
+// The ARC firmware answers every aggregated power-state message that covers the
+// L2CPU domain by calling bh_set_l2cpu_enable(), whether or not the state
+// changed, and that reprograms the shared L2CPU PLL (PLL4) to its cached
+// 800 MHz under any running X280 guest. A legacy open() sends such a message.
+// Measured on a p150a 2026-09-24: a bare open of /dev/tenstorrent/0 dropped a
+// running guest from 1750 to 800 MHz (claude:ai/tenstorrent/blackhole/p150a/
+// audit/2026-09-24-l2cpu-plumbing-p4-p6-p8-*). With this set, the aggregate
+// is sent with a flag count that stops BELOW the L2CPU flag, so the firmware
+// skips that domain; AICLK, MRISC and Tensix are applied as before.
+bool l2cpu_power_hands_off = false;
+module_param(l2cpu_power_hands_off, bool, 0644);
+MODULE_PARM_DESC(l2cpu_power_hands_off,
+		 "DEFAULT OFF. Never send the L2CPU power domain to firmware, so "
+		 "no device open/close can reprogram the L2CPU PLL under a running "
+		 "guest. The L2CPU clock domain then stays as the last explicit "
+		 "setting left it.");
+
 uint bh_hung_threshold = 3;
 module_param(bh_hung_threshold, uint, 0644);
 MODULE_PARM_DESC(bh_hung_threshold,
