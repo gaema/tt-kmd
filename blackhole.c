@@ -68,7 +68,7 @@
 // How long ARC_BOOT_STATUS may read all-ones CONTINUOUSLY before the device is
 // declared dead on the latch-neutral poll path.  Must exceed the worst real ARC
 // init by a wide margin: measured worst post-reset init is 35.9 s (host-observed,
-// ai/tenstorrent/blackhole/design/power/audit/2026-08-10-dmc-arc-boot-guard.md),
+// from an Aug-2026 DMC/ARC boot-guard audit),
 // so 120 s is ~3.3x that.  Overshooting only delays fencing a dead die;
 // undershooting fences a healthy one that is still booting, which is the exact
 // regression this whole path exists to avoid.
@@ -270,7 +270,7 @@ static u8 __iomem *bh_configure_kernel_tlb(struct blackhole_device *bh, u32 x, u
 // - Endpoint gone: PCI config vendor-ID fails / not Tenstorrent, or BAR0
 //   NOC_ID is all-ones (link/BAR dead).  Wormhole-shaped probe.
 // - Path dead, endpoint alive: TLB/NoC returns all-ones while BAR0 still
-//   answers.  That is the aipro ARC/NoC hang class; the first land of this
+//   answers.  That is the p150a-host ARC/NoC hang class; the first land of this
 //   latch incorrectly required the endpoint probe to agree, so it never
 //   armed and hwmon kept issuing TLB MMIO forever.
 static bool bh_endpoint_reset_under_us(struct blackhole_device *bh);
@@ -404,7 +404,7 @@ static int bh_noc_read32(struct blackhole_device *bh, u32 x, u32 y, u64 addr, in
 		// the kernel's struct resource still says f8_0000_0000.  Every BAR
 		// read then returns all-ones and this latch armed on a HEALTHY,
 		// freshly re-bootrommed chip.  Measured 2026-08-29 on all four p300c
-		// dies of tt-quietbox: vendor id answered, BAR0 register read
+		// dies of the p300c (2-card) host: vendor id answered, BAR0 register read
 		// 0x0000000c (base 0), NOC_ID live the instant the BARs were
 		// re-programmed by hand.  Upstream v2.9.0 has the same blind spot.
 		// So: if config space answers and BAR0's base is zero, restore the
@@ -1022,8 +1022,8 @@ static bool send_arc_message(struct blackhole_device *bh, struct arc_msg *msg)
 			// finish booting into a driver that would no longer talk to it.
 			// A genuinely dead device still latches via the streak path on
 			// the hwmon/telemetry/ioctl reads, which is what that path is
-			// for.  Measured 2026-08-29: p150a on aipro failed this way on
-			// some boots and not others; p300c on tt-quietbox is a real
+			// for.  Measured 2026-08-29: the p150a host failed this way on
+			// some boots and not others; the p300c (2-card) host is a real
 			// hang and latches correctly through the streak path.
 			return false;
 		}
@@ -1114,7 +1114,7 @@ static bool blackhole_reset(struct tenstorrent_device *tt_dev, u32 reset_flag)
 // PVT sdif_busy wait in init_telemetry(), which sits AFTER init_msgqueue() --
 // happily accepts REINIT_TENSIX, runs ClearNocTranslation()/NocInit()/
 // TensixInit() underneath a half-initialised chip, and the NoC goes all-ones
-// for good.  Measured 2026-08-28 on tt-quietbox: msg_queue_ready set, our
+// for good.  Measured 2026-08-28 on the p300c host: msg_queue_ready set, our
 // last-close REINIT pushed at t~72, NoC dark at t=74, on all four p300c dies;
 // upstream's kmd never sends this message, so upstream sees only the stall.
 //

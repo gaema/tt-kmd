@@ -49,7 +49,7 @@ static bool poll_pcie_link_up(struct pci_dev *pdev, u32 timeout_ms) {
 // malformed there (UESta MalfTLP) and dropped, so the device-side read that asked for
 // them never retires and the device hangs. The saved state then carries the wrong value
 // through every later reset, so a warm reset can never repair it.
-// Seen on tt-quietbox 0000:03:00.0: endpoint 128, root port 512.
+// Seen on the p300c host at the affected card's BDF: endpoint 128, root port 512.
 void tt_pcie_sync_mps(struct pci_dev *pdev)
 {
 	struct pci_dev *bridge = pci_upstream_bridge(pdev);

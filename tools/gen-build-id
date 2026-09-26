@@ -26,7 +26,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # /usr/src/tenstorrent-<version>/ but skips dotfiles entirely, so a stamp named
 # .gaema-build-id never reaches the DKMS build and every DKMS-built module
 # reported "unknown" -- defeating the exact case this cache exists for.
-# Measured on tt-quietbox: `ls -a /usr/src/tenstorrent-2.9.0-gaema/` contained
+# Measured on the p300c (2-card) host: `ls -a /usr/src/tenstorrent-2.9.0-gaema/` contained
 # no dotfiles at all.
 STAMP="${PROJECT_ROOT}/gaema-build-id"
 

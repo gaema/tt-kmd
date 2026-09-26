@@ -7,7 +7,7 @@
 //
 // `tt-kmd` owns the PCI device and every BAR mapping, so a second module cannot
 // reach the NOC without tt-kmd handing it something.  The framework plan
-// (ai/tenstorrent/blackhole/p150a/plan/h2h-dma-framework.md §4a) chose an
+// (framework design section 4a) chose an
 // exported accessor over forking the driver: an entire RDMA dataplane living
 // inside a rebased vendor tree is expensive to carry, a handful of exports is
 // not.  Keeping them in their OWN file means a vendor rebase touches
