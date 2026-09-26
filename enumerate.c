@@ -22,6 +22,7 @@
 #include "chardev_private.h"
 #include "wormhole.h"
 #include "tlb.h"
+#include "pcie.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0) || TT_RHEL_RELEASE_GE(9, 4)
 #define pci_enable_pcie_error_reporting(dev) do { } while (0)
@@ -371,6 +372,8 @@ static int tenstorrent_pci_probe(struct pci_dev *dev, const struct pci_device_id
 
 	tt_dev->needs_hw_init = !device_class->init_hardware(tt_dev);
 
+	// The first save sets the MPS every later restore re-applies (see tt_pcie_sync_mps).
+	tt_pcie_sync_mps(dev);
 	pci_save_state(dev);
 	device_class->save_reset_state(tt_dev);
 
@@ -520,8 +523,10 @@ static int tenstorrent_resume(struct device *dev) {
 	bool ok = tt_dev->dev_class->init_hardware(tt_dev);
 
 	// Suspend invalidates the saved state.
-	if (ok)
+	if (ok) {
+		tt_pcie_sync_mps(pdev);
 		pci_save_state(pdev);
+	}
 
 	return ok ? 0 : -EIO;
 }
@@ -577,6 +582,7 @@ static pci_ers_result_t tenstorrent_slot_reset(struct pci_dev *dev)
 
 	pci_set_master(dev);
 	pci_restore_state(dev);
+	tt_pcie_sync_mps(dev);
 	pci_save_state(dev);
 
 	return PCI_ERS_RESULT_RECOVERED;

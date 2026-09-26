@@ -40,6 +40,39 @@ static bool poll_pcie_link_up(struct pci_dev *pdev, u32 timeout_ms) {
 	return true;
 }
 
+// Make the endpoint's Max_Payload_Size agree with its upstream port. Call before every
+// pci_save_state().
+//
+// A reset puts DevCtl back at its power-on MPS (128 bytes). If pci_save_state() captures
+// that, every later pci_restore_state() re-applies it, while the upstream port keeps
+// sending TLPs of up to its own MPS. Completions larger than the endpoint's MPS are
+// malformed there (UESta MalfTLP) and dropped, so the device-side read that asked for
+// them never retires and the device hangs. The saved state then carries the wrong value
+// through every later reset, so a warm reset can never repair it.
+// Seen on tt-quietbox 0000:03:00.0: endpoint 128, root port 512.
+void tt_pcie_sync_mps(struct pci_dev *pdev)
+{
+	struct pci_dev *bridge = pci_upstream_bridge(pdev);
+	int bridge_mps, want, have;
+
+	if (!bridge || !pci_is_pcie(pdev) || !pci_is_pcie(bridge))
+		return;
+
+	bridge_mps = pcie_get_mps(bridge);
+	want = min(bridge_mps, 128 << pdev->pcie_mpss);
+	have = pcie_get_mps(pdev);
+	if (have == want)
+		return;
+
+	if (pcie_set_mps(pdev, want)) {
+		dev_warn(&pdev->dev, "Max_Payload_Size %d differs from upstream port %d and could not be set to %d\n",
+			 have, bridge_mps, want);
+		return;
+	}
+	dev_warn(&pdev->dev, "Max_Payload_Size was %d, upstream port uses %d: set to %d\n",
+		 have, bridge_mps, pcie_get_mps(pdev));
+}
+
 bool safe_pci_restore_state(struct pci_dev *pdev) {
 	u16 vendor_id;
 
@@ -54,6 +87,9 @@ bool safe_pci_restore_state(struct pci_dev *pdev) {
 		return false;
 
 	pci_restore_state(pdev);
+	// The saved state may carry a stale MPS captured after an earlier reset. Correct it
+	// before re-saving, so a bad value is not kept.
+	tt_pcie_sync_mps(pdev);
 	pci_save_state(pdev);
 	return true;
 }
@@ -122,6 +158,7 @@ bool wormhole_complete_pcie_init(struct tenstorrent_device *tt_dev, u8 __iomem* 
 				return false;
 		}
 
+		tt_pcie_sync_mps(pdev);
 		pci_save_state(pdev);
 		if (!pcie_hot_reset_and_restore_state(pdev))
 			return false;
