@@ -90,8 +90,8 @@ MODULE_PARM_DESC(reset_on_last_close,
 // changed, and that reprograms the shared L2CPU PLL (PLL4) to its cached
 // 800 MHz under any running X280 guest. A legacy open() sends such a message.
 // Measured on a p150a 2026-09-24: a bare open of /dev/tenstorrent/0 dropped a
-// running guest from 1750 to 800 MHz (claude:ai/tenstorrent/blackhole/p150a/
-// audit/2026-09-24-l2cpu-plumbing-p4-p6-p8-*). With this set, the aggregate
+// running guest from 1750 to 800 MHz (measured in the 2026-09 p150a L2CPU
+// plumbing audit).  With this set, the aggregate
 // is sent with a flag count that stops BELOW the L2CPU flag, so the firmware
 // skips that domain; AICLK, MRISC and Tensix are applied as before.
 bool l2cpu_power_hands_off = false;
