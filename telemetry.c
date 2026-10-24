@@ -53,6 +53,20 @@ ssize_t tt_sysfs_show_u32_dec(struct device *dev, struct device_attribute *attr,
 	return scnprintf(buf, PAGE_SIZE, "%u\n", value);
 }
 
+ssize_t tt_sysfs_show_u32_hex(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);
+	struct tenstorrent_sysfs_attr *data = container_of(attr, struct tenstorrent_sysfs_attr, attr);
+	u32 value;
+	int r;
+
+	r = tt_telemetry_read32(tt_dev, data->tag_id, &value);
+	if (r)
+		return r;
+
+	return scnprintf(buf, PAGE_SIZE, "0x%x\n", value);
+}
+
 ssize_t tt_sysfs_show_u64_hex(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct tenstorrent_device *tt_dev = dev_get_drvdata(dev);

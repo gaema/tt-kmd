@@ -897,6 +897,11 @@ static struct tenstorrent_sysfs_attr bh_sysfs_attributes[] = {
 	{ TELEMETRY_ASIC_ID, __ATTR(tt_asic_id, S_IRUGO, tt_sysfs_show_u64_hex, NULL) },
 	{ TELEMETRY_TIMER_HEARTBEAT, __ATTR(tt_heartbeat, S_IRUGO, tt_sysfs_show_u32_dec, NULL) },
 	{ TELEMETRY_THERM_TRIP_COUNT, __ATTR(tt_therm_trip_count, S_IRUGO, tt_sysfs_show_u32_dec, NULL) },
+	// The enabled-Tensix-column mask the firmware publishes after harvesting. It is the one source of a die's grid
+	// that needs no device open: the visible worker grid is (popcount - 1 dispatch column) x 10 rows, and it moves
+	// with every flash (110 / 120 / 130 on our cards) under an unchanged fw_bundle_version. Hidden, like every row
+	// here, on firmware that does not publish the tag.
+	{ TELEMETRY_ENABLED_TENSIX_COL, __ATTR(tt_tensix_col_enabled, S_IRUGO, tt_sysfs_show_u32_hex, NULL) },
 };
 
 static const struct hwmon_channel_info *bh_hwmon_channel_info[] = {

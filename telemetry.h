@@ -30,6 +30,7 @@ enum tt_telemetry_tags {
     TELEMETRY_CM_FW_VERSION = 29,
     TELEMETRY_FAN_SPEED = 31,
     TELEMETRY_TIMER_HEARTBEAT = 32,
+    TELEMETRY_ENABLED_TENSIX_COL = 34,  // bitmask of enabled Tensix columns, after harvesting (CMFW tile_enable.tensix_col_enabled)
     TELEMETRY_FAN_RPM = 41,
     TELEMETRY_TDC_LIMIT_MAX = 55,
     TELEMETRY_THM_LIMIT_THROTTLE = 56,
@@ -50,6 +51,7 @@ int tt_telemetry_read32(struct tenstorrent_device *tt_dev, u16 tag_id, u32 *valu
 
 // Common sysfs show callbacks for telemetry attributes.
 ssize_t tt_sysfs_show_u32_dec(struct device *dev, struct device_attribute *attr, char *buf);
+ssize_t tt_sysfs_show_u32_hex(struct device *dev, struct device_attribute *attr, char *buf);
 ssize_t tt_sysfs_show_u64_hex(struct device *dev, struct device_attribute *attr, char *buf);
 ssize_t tt_sysfs_show_u32_ver(struct device *dev, struct device_attribute *attr, char *buf);
 ssize_t tt_sysfs_show_card_type(struct device *dev, struct device_attribute *attr, char *buf);
